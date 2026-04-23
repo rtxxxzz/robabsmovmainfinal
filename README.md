@@ -29,13 +29,20 @@ Works identically in **Gazebo simulation** and on **real hardware** via the stan
 
 ## Overview
 
-This package provides a **three-phase proportional controller** that drives a TurtleBot3 Burger to an absolute pose in the odometry frame:
+This package provides a **three-phase proportional controller** with **reactive obstacle avoidance** that drives a TurtleBot3 Burger to an absolute pose in the odometry frame:
 
 | Phase | Behavior |
 |-------|----------|
 | **1 — Rotate to target** | Turn in place to face the goal (x, y) |
-| **2 — Translate** | Drive toward the goal with heading correction |
+| **2 — Translate** | Drive toward the goal with gap-based LiDAR obstacle avoidance |
 | **3 — Align heading** | Turn in place to the desired final heading |
+
+**Key features:**
+- **LiDAR gap-finding**: when an obstacle blocks the direct path, the node scans the full LiDAR for the best open gap closest to the goal direction and steers through it
+- **Stuck recovery**: if the robot makes no progress for `stuck_timeout` seconds, it backs up and rotates toward the best gap, retrying up to `max_recovery_attempts` times
+- **Best-effort reaching**: if the goal is unreachable (e.g. inside a wall), the robot stops at the closest achievable position and still aligns its heading
+- **Tilt detection**: in Gazebo, detects chassis tipping and calls the Gazebo API to restore the robot upright and continue
+- **SLAM integration**: SLAM Toolbox runs by default, keeping the odom frame drift-corrected via the `map→odom` TF
 
 The controller is exposed as a **ROS 2 action server**, making it usable from:
 - The included interactive CLI client
@@ -49,13 +56,16 @@ The controller is exposed as a **ROS 2 action server**, making it usable from:
 ### With SLAM (default)
 
 ```
-┌──────────────────┐         ┌───────────────────────┐
-│  CLI Client or   │ action  │  absolute_move_node   │
-│  Custom Client   ├────────►│                       │
-│                  │         │  • /odom subscriber   │
-└──────────────────┘         │  • /cmd_vel publisher │
-                             │  • 3-phase controller │
-                             └───────┬───────────────┘
+┌──────────────────┐         ┌───────────────────────────────┐
+│  CLI Client or   │ action  │  absolute_move_node           │
+│  Custom Client   ├────────►│                               │
+│                  │         │  • /odom subscriber (pose)    │
+└──────────────────┘         │  • /scan subscriber (LiDAR)  │
+                             │  • /cmd_vel publisher        │
+                             │  • 3-phase P-controller      │
+                             │  • Gap-finding obstacle avoid│
+                             │  • Stuck recovery + tilt det.│
+                             └───────┬───────────────────────┘
                                      │ cmd_vel
                                      ▼
                              ┌───────────────────┐
@@ -68,7 +78,6 @@ The controller is exposed as a **ROS 2 action server**, making it usable from:
                              │  SLAM Toolbox (online async)  │
                              │  • Builds /map in real time   │
                              │  • Publishes map→odom TF      │
-                             │    (keeps odom frame stable)  │
                              └───────────────────────────────┘
 ```
 
@@ -448,9 +457,11 @@ ros2 run turtlebot3_absolute_move absolute_move_client -- --goal 2.0 1.0 45
 
 ### Absolute Move Parameter Reference
 
-| Parameter | Sim (`params_sim.yaml`) | HW (`params_hw.yaml`) | Unit | Description |
-|-----------|------------------------|----------------------|------|-------------|
-| `max_linear_speed` | 0.18 | 0.18 | m/s | Forward speed cap |
+**Core control:**
+
+| Parameter | Sim | HW | Unit | Description |
+|-----------|-----|-----|------|-------------|
+| `max_linear_speed` | 0.12 | 0.18 | m/s | Forward speed cap |
 | `max_angular_speed` | **1.0** | 2.0 | rad/s | Rotation speed cap |
 | `position_tolerance` | 0.05 | 0.03 | m | Goal position threshold |
 | `heading_tolerance` | 0.05 | 0.03 | rad | Goal heading threshold |
@@ -458,8 +469,32 @@ ros2 run turtlebot3_absolute_move absolute_move_client -- --goal 2.0 1.0 45
 | `kp_angular` | **1.5** | 3.0 | — | Proportional gain for angular velocity |
 | `control_rate` | 30.0 | 30.0 | Hz | Control loop frequency |
 
+**Stuck detection & recovery:**
+
+| Parameter | Sim | HW | Unit | Description |
+|-----------|-----|-----|------|-------------|
+| `stuck_timeout` | 5.0 | 8.0 | s | Time before declaring stuck |
+| `stuck_distance` | 0.03 | 0.03 | m | Min progress required per timeout |
+| `max_recovery_attempts` | 3 | 3 | — | Back-up + rotate attempts before abort |
+| `recovery_backup_speed` | 0.05 | 0.05 | m/s | Reverse speed during recovery |
+| `recovery_backup_time` | 1.5 | 1.5 | s | Duration of reverse |
+
+**LiDAR obstacle avoidance:**
+
+| Parameter | Sim | HW | Unit | Description |
+|-----------|-----|-----|------|-------------|
+| `obstacle_distance` | 0.25 | 0.30 | m | Distance threshold for obstacle detection |
+| `obstacle_angle_deg` | 30.0 | 30.0 | deg | Half-angle of forward detection cone |
+
+**Tilt detection (simulation only):**
+
+| Parameter | Sim | HW | Unit | Description |
+|-----------|-----|-----|------|-------------|
+| `tilt_threshold_deg` | 40.0 | 40.0 | deg | Combined roll+pitch = tipped |
+| `use_gazebo_reset` | true | false | — | Call Gazebo API to restore upright pose |
+
 > ⚠️ **Why sim `max_angular_speed` is 1.0 (not 2.84):**  
-> Gazebo's default physics timestep cannot handle sustained commands at the TurtleBot3's rated hardware maximum of 2.84 rad/s. At that speed the chassis tips, a wheel lifts off the ground, and odometry corrupts — causing the robot to spin uncontrollably. The value 1.0 rad/s is the safe upper bound for stable Gazebo simulation. **Do not raise it above ~1.2 rad/s in sim.**
+> Gazebo's default physics timestep cannot handle sustained commands at 2.84 rad/s. The chassis tips, a wheel lifts, and odometry corrupts. **Do not raise above ~1.2 rad/s in sim.**
 
 ### SLAM Toolbox Key Settings (`params_slam.yaml`)
 
@@ -626,10 +661,17 @@ Run the same tests with smaller distances (0.3 m) first, in an open area.
 
 ### Robot moves but never reaches the goal
 
+- The robot may be stuck behind an obstacle. Check the log for `Phase 2 stuck` messages
+- If stuck with obstacles, the robot will try up to `max_recovery_attempts` times (back up + rotate) before reporting best-effort position
 - Odom drift may exceed tolerance for long distances
 - Try increasing `position_tolerance` temporarily
-- Check `ros2 topic echo /odom` to see if odometry is updating
 - With SLAM disabled (`slam:=false`) drift accumulates — re-enable SLAM for long runs
+
+### Robot reports "Partial: closest approach"
+
+- The goal position is blocked by obstacles. The robot reached the closest achievable position
+- Check if a different approach angle works: try sending the robot to a nearby unblocked point first
+- The `position_error` in the result tells you how far the robot is from the requested goal
 
 ### "No odometry received" error
 
@@ -657,17 +699,19 @@ The node uses relative topic names (`cmd_vel`, `odom`) so they work with or with
 
 ## Known Limitations
 
-1. **No obstacle avoidance**: The controller does not subscribe to `/scan` or perform collision checking. SLAM builds a map, but the controller does not use it for path planning. The robot will attempt to drive through obstacles. Add a safety node or use Nav2 for obstacle-aware navigation.
+1. **Reactive, not global**: The obstacle avoidance uses gap-finding on the live LiDAR scan (reactive). It does not plan a global path on the SLAM map. For complex mazes or narrow corridors, Nav2 with a global planner is more reliable.
 
 2. **Single goal at a time**: The action server processes one goal at a time. Sending a new goal while one is executing will preempt the current goal.
 
 3. **P-only control**: The controller uses proportional-only control. For most TurtleBot3 use cases this is sufficient, but aggressive gains may cause overshoot. PID could be added if needed.
 
-4. **No global path planning**: The robot moves in a straight line (after initial rotation). It will not navigate around walls or obstacles. Use Nav2 for obstacle-aware routing.
+4. **Best-effort is not guaranteed optimal**: When a goal is unreachable, the robot stops at the closest position it reached during its attempts. This may not be the globally closest reachable point.
 
 5. **Odom frame assumption**: All goals are in the `odom` frame. With SLAM enabled (default), the `odom` frame is kept calibrated against the `map` frame. Without SLAM, goals are relative to the boot position only.
 
 6. **SLAM requires LiDAR**: SLAM Toolbox needs `/scan` data (TurtleBot3 LiDAR). If the LiDAR is not working or `/scan` is not publishing, SLAM will not build a map and the `map → odom` TF will not be published. Disable SLAM with `slam:=false` to fall back to raw odometry.
+
+7. **Tilt recovery is sim-only**: The Gazebo `set_entity_state` API is used to restore the robot when tipped. On real hardware, tilt detection will abort the goal but cannot physically right the robot.
 
 ---
 

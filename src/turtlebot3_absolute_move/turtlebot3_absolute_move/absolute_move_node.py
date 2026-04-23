@@ -10,11 +10,19 @@ Reactive obstacle avoidance:
   to the goal heading.  The robot steers through the gap at reduced speed
   and resumes direct control once the path clears.  If stuck (no progress
   for stuck_timeout seconds), it backs up, rotates toward the best gap,
-  and retries up to max_recovery_attempts times before aborting.
+  and retries up to max_recovery_attempts times.
 
-  Tilt detection monitors the odom quaternion.  In simulation the node
-  calls /gazebo/set_entity_state to restore the robot upright and
-  continues the goal.
+Best-effort reaching:
+  If the goal is unreachable (all recovery attempts exhausted), the node
+  does NOT simply abort.  Instead it:
+    1. Records the closest position achieved during Phase 2
+    2. Still performs Phase 3 (heading alignment) at the closest position
+    3. Reports success=False with a clear message and the actual
+       position/heading errors, so the caller can decide what to do next.
+
+Tilt detection:
+  Monitors the odom quaternion for chassis tipping.  In simulation, calls
+  /gazebo/set_entity_state to restore the robot upright and continues.
 """
 
 import math
@@ -187,7 +195,7 @@ class AbsoluteMoveNode(Node):
         return CancelResponse.ACCEPT
 
     # ------------------------------------------------------------------
-    # Execute
+    # Execute — with best-effort reaching
     # ------------------------------------------------------------------
 
     def _execute_cb(self, goal_handle):
@@ -203,37 +211,67 @@ class AbsoluteMoveNode(Node):
         if not self._wait_for_odom(goal_handle, rate):
             return self._abort(goal_handle, 'No odometry received.')
 
+        # --- Phase 1: rotate to face target ---
         ok = self._phase_rotate_to_target(goal_handle, tx, ty, feedback, rate)
         if ok is None:
             return self._abort(goal_handle, 'Stuck in Phase 1.')
         if not ok:
             return self._cancelled(goal_handle)
 
-        ok = self._phase_translate(goal_handle, tx, ty, th, feedback, rate)
-        if ok is None:
-            return self._abort(goal_handle, 'Could not reach target.')
-        if not ok:
+        # --- Phase 2: translate (with obstacle avoidance) ---
+        phase2_result = self._phase_translate(
+            goal_handle, tx, ty, th, feedback, rate)
+
+        if phase2_result == 'cancelled':
             return self._cancelled(goal_handle)
 
+        # phase2_result is True (reached) or 'partial' (closest approach)
+        is_partial = (phase2_result == 'partial')
+
+        if is_partial:
+            cx, cy, cyaw, _ = self._get_pose()
+            remaining = math.hypot(tx - cx, ty - cy)
+            self.get_logger().warn(
+                f'Target unreachable. Best approach: {remaining:.3f} m '
+                f'from goal. Aligning heading at current position.')
+
+        # --- Phase 3: final heading alignment ---
         ok = self._phase_final_heading(goal_handle, th, feedback, rate)
         if ok is None:
-            return self._abort(goal_handle, 'Stuck in Phase 3.')
-        if not ok:
+            # Even Phase 3 stuck — still report what we achieved
+            pass
+        if ok is False:
             return self._cancelled(goal_handle)
 
+        # --- Build result ---
         self._stop()
         cx, cy, cyaw, _ = self._get_pose()
-        result.success       = True
-        result.message       = 'Goal reached.'
         result.final_x       = cx
         result.final_y       = cy
         result.final_heading = cyaw
         result.position_error = math.hypot(tx - cx, ty - cy)
         result.heading_error  = abs(normalize_angle(th - cyaw))
-        goal_handle.succeed()
-        self.get_logger().info(
-            f'Goal reached: ({cx:.3f}, {cy:.3f}, '
-            f'{math.degrees(cyaw):.1f} deg)')
+
+        if is_partial:
+            result.success = False
+            result.message = (
+                f'Partial: closest approach {result.position_error:.3f} m '
+                f'from goal (heading err {math.degrees(result.heading_error):.1f} deg). '
+                f'Target may be unreachable.')
+            self.get_logger().warn(
+                f'Partial result: ({cx:.3f}, {cy:.3f}, '
+                f'{math.degrees(cyaw):.1f} deg) — '
+                f'{result.position_error:.3f} m from goal')
+            goal_handle.abort()
+        else:
+            result.success = True
+            result.message = 'Goal reached.'
+            self.get_logger().info(
+                f'Goal reached: ({cx:.3f}, {cy:.3f}, '
+                f'{math.degrees(cyaw):.1f} deg) — '
+                f'err={result.position_error:.3f} m')
+            goal_handle.succeed()
+
         return result
 
     # ------------------------------------------------------------------
@@ -250,6 +288,7 @@ class AbsoluteMoveNode(Node):
         return self._odom_received
 
     def _phase_rotate_to_target(self, goal_handle, tx, ty, fb, rate):
+        """Phase 1 — rotate to face target. Returns True/False/None."""
         cx, cy, cyaw, _ = self._get_pose()
         if math.hypot(tx - cx, ty - cy) < self._pos_tol:
             return True
@@ -306,11 +345,10 @@ class AbsoluteMoveNode(Node):
     def _phase_translate(self, goal_handle, tx, ty, th, fb, rate):
         """Drive toward (tx, ty) with reactive obstacle avoidance.
 
-        When an obstacle blocks the direct path, analyses the LiDAR scan
-        for the best open gap closest to the goal direction and steers
-        through it.  When the direct path is clear, uses normal P-control.
-
-        Returns True / False (cancelled) / None (stuck).
+        Returns:
+            True        — reached the goal position
+            'cancelled' — goal was cancelled
+            'partial'   — could not reach; stopped at closest approach
         """
         cx, cy, cyaw, _ = self._get_pose()
         dist = math.hypot(tx - cx, ty - cy)
@@ -324,12 +362,12 @@ class AbsoluteMoveNode(Node):
 
         while dist > self._pos_tol:
             if goal_handle.is_cancel_requested:
-                self._stop(); return False
+                self._stop(); return 'cancelled'
 
             # ── Tilt recovery ─────────────────────────────────────
             if self._get_tilt() > self._tilt_threshold:
                 if not self._try_tilt_recovery():
-                    return None
+                    self._stop(); return 'partial'
                 cx, cy, cyaw, _ = self._get_pose()
                 dist = math.hypot(tx - cx, ty - cy)
                 best_dist     = dist
@@ -350,8 +388,8 @@ class AbsoluteMoveNode(Node):
                     self._stop()
                     self.get_logger().error(
                         f'Phase 2: {self._max_recovery} recovery '
-                        f'attempts exhausted. Aborting.')
-                    return None
+                        f'attempts exhausted (dist={dist:.3f} m).')
+                    return 'partial'
                 recovery_attempts += 1
                 self.get_logger().warn(
                     f'Phase 2 stuck - recovery {recovery_attempts}/'
@@ -386,10 +424,11 @@ class AbsoluteMoveNode(Node):
             cmd.angular.z = angular_speed
             self._cmd_pub.publish(cmd)
 
+            # Feedback — show heading-to-target error (what controller uses)
             fb.current_x = cx; fb.current_y = cy
             fb.current_heading = cyaw
             fb.distance_remaining = dist
-            fb.heading_error = normalize_angle(th - cyaw)
+            fb.heading_error = heading_err
             fb.phase = 'translate'
             goal_handle.publish_feedback(fb)
             rate.sleep()
@@ -403,6 +442,7 @@ class AbsoluteMoveNode(Node):
     # ------------------------------------------------------------------
 
     def _phase_final_heading(self, goal_handle, th, fb, rate):
+        """Phase 3 — final heading. Returns True/False/None."""
         cx, cy, cyaw, _ = self._get_pose()
         heading_err   = normalize_angle(th - cyaw)
         best_abs_err  = abs(heading_err)
@@ -488,7 +528,6 @@ class AbsoluteMoveNode(Node):
         open_mask = []
         for i in range(n):
             r = ranges[i]
-            # "open" = range exceeds safe distance or is invalid/inf
             open_mask.append(r > safe or r < scan.range_min)
 
         # Group consecutive open indices into gap runs
@@ -510,7 +549,7 @@ class AbsoluteMoveNode(Node):
                 gaps.append((start, n - start))
 
         if not gaps:
-            return None  # everything blocked — recovery will handle it
+            return None  # everything blocked
 
         # Minimum gap width: ~20 cm robot body at obstacle_distance
         min_gap = max(3, int(0.3 / (safe * inc + 1e-9)))
@@ -529,7 +568,7 @@ class AbsoluteMoveNode(Node):
                 best_score = score
                 best_dir   = gap_world
 
-        return best_dir  # None if all gaps too narrow
+        return best_dir
 
     # ------------------------------------------------------------------
     # Tilt recovery

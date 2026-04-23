@@ -51,7 +51,7 @@ class AbsoluteMoveClient(Node):
 
         self.get_logger().info(
             f'Sending goal: x={x:.3f}, y={y:.3f}, '
-            f'heading={heading_deg:.1f}° ({heading_rad:.3f} rad)')
+            f'heading={heading_deg:.1f} deg ({heading_rad:.3f} rad)')
 
         self._done_event.clear()
         future = self._client.send_goal_async(
@@ -77,27 +77,30 @@ class AbsoluteMoveClient(Node):
         result = future.result().result
         if result.success:
             self.get_logger().info(
-                f'✓ Goal reached: ({result.final_x:.3f}, '
+                f'Goal reached: ({result.final_x:.3f}, '
                 f'{result.final_y:.3f}, '
-                f'{math.degrees(result.final_heading):.1f}°)')
+                f'{math.degrees(result.final_heading):.1f} deg)')
             self.get_logger().info(
                 f'  Position error: {result.position_error:.4f} m, '
-                f'Heading error: {math.degrees(result.heading_error):.2f}°')
+                f'Heading error: {math.degrees(result.heading_error):.2f} deg')
         else:
-            self.get_logger().warn(f'Goal failed: {result.message}')
+            self.get_logger().warn(f'Goal result: {result.message}')
             self.get_logger().info(
                 f'  Final pose: ({result.final_x:.3f}, '
                 f'{result.final_y:.3f}, '
-                f'{math.degrees(result.final_heading):.1f}°)')
+                f'{math.degrees(result.final_heading):.1f} deg)')
+            if result.position_error > 0:
+                self.get_logger().info(
+                    f'  Remaining distance: {result.position_error:.3f} m')
         self._done_event.set()
 
     def _feedback_cb(self, feedback_msg):
         fb = feedback_msg.feedback
         self.get_logger().info(
             f'  [{fb.phase}] pos=({fb.current_x:.3f}, {fb.current_y:.3f}) '
-            f'heading={math.degrees(fb.current_heading):.1f}° '
+            f'heading={math.degrees(fb.current_heading):.1f} deg '
             f'dist_rem={fb.distance_remaining:.3f} m '
-            f'head_err={math.degrees(fb.heading_error):.1f}°')
+            f'head_err={math.degrees(fb.heading_error):.1f} deg')
 
     def cancel_goal(self):
         """Cancel the current goal."""
@@ -135,8 +138,11 @@ def main(args=None):
     if cli_goal:
         x, y, h = cli_goal
         client.send_goal(x, y, h)
+        # Clean shutdown: destroy node first, then shutdown rclpy,
+        # then join the spin thread (which will exit once shutdown).
         client.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
+        spin_thread.join(timeout=2.0)
         return
 
     # Interactive mode
@@ -160,13 +166,13 @@ def main(args=None):
 
             parts = line.split()
             if len(parts) != 3:
-                print('  ✗ Enter exactly 3 values: x y heading_degrees')
+                print('  Enter exactly 3 values: x y heading_degrees')
                 continue
 
             try:
                 x, y, h = float(parts[0]), float(parts[1]), float(parts[2])
             except ValueError:
-                print('  ✗ Invalid numbers. Example: 1.0 0.5 90')
+                print('  Invalid numbers. Example: 1.0 0.5 90')
                 continue
 
             client.send_goal(x, y, h)
@@ -177,7 +183,8 @@ def main(args=None):
         client.cancel_goal()
 
     client.destroy_node()
-    rclpy.shutdown()
+    rclpy.try_shutdown()
+    spin_thread.join(timeout=2.0)
 
 
 if __name__ == '__main__':

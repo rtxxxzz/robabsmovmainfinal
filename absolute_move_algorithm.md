@@ -179,9 +179,9 @@ The `atan2` function correctly handles all four quadrants and the discontinuity 
 
 ---
 
-### Phase 2 — Translate to Target Position
+### Phase 2 — Translate to Target Position (with Reactive Obstacle Avoidance)
 
-**Goal:** Drive to (tx, ty) while continuously correcting heading drift.
+**Goal:** Drive to (tx, ty) while continuously correcting heading drift and avoiding obstacles.
 
 **Control loop (30 Hz):**
 ```
@@ -189,17 +189,29 @@ dist            = hypot(tx - cx, ty - cy)
 angle_to_target = atan2(ty - cy, tx - cx)
 heading_err     = normalize(angle_to_target - yaw_current)
 
-# --- Linear velocity (P-control + heading factor) ---
-linear_speed_raw = clamp(kp_linear × dist, max_linear_speed)
-heading_factor   = max(0.0, cos(heading_err))          ← KEY TRICK
-linear_speed     = linear_speed_raw × heading_factor
+# --- Gap-based obstacle avoidance ---
+gap_dir = find_best_gap(angle_to_target)    # returns None if path clear
 
-# --- Angular velocity (P-control) ---
-angular_speed = clamp(kp_angular × heading_err, max_angular_speed)
-
-cmd.linear.x  = linear_speed
-cmd.angular.z = angular_speed
+if gap_dir is None:
+    # Direct path clear — normal P-control
+    linear_speed = clamp(kp_linear × dist, max_linear_speed)
+    linear_speed ×= max(0.0, cos(heading_err))
+    angular_speed = clamp(kp_angular × heading_err, max_angular_speed)
+else:
+    # Obstacle ahead — steer toward the best gap at half speed
+    steer_err     = normalize(gap_dir - yaw_current)
+    linear_speed  = max_linear_speed × 0.5 × max(0.0, cos(steer_err))
+    angular_speed = clamp(kp_angular × steer_err, max_angular_speed)
 ```
+
+**The Gap-Finding Algorithm (`_find_best_gap`):**
+
+1. Check the forward ±30° cone for obstacles closer than `obstacle_distance`
+2. If clear → return `None` (normal P-control)
+3. If blocked → scan the full 360° LiDAR for consecutive "open" indices
+4. Group them into gaps; filter out gaps narrower than the robot body (~20 cm)
+5. Pick the gap whose centre direction is closest to the goal heading
+6. Return that direction as the steering target
 
 **The `cos(heading_err)` Heading Factor — why it matters:**
 
@@ -210,9 +222,28 @@ cmd.angular.z = angular_speed
 | 90° | 0.0 | Stop! Pure rotation |
 | > 90° (behind) | negative → clamped to 0.0 | Never go backward |
 
-Without this factor, the robot would arc widely when it drifts off the ideal heading. With it, the robot _slows down or stops_ when misaligned, and only accelerates once it's roughly facing the target. This produces a tight, efficient trajectory.
+**Stuck Detection & Recovery:**
 
-**Termination:** `dist ≤ position_tolerance` (default 0.02 m = 2 cm)
+During Phase 2, the node monitors distance progress. If the robot fails to improve by `stuck_distance` metres within `stuck_timeout` seconds:
+
+1. **Recovery maneuver:** backs up at `recovery_backup_speed` for `recovery_backup_time`, then rotates toward the best LiDAR gap (or 90° if no gap found)
+2. Retries up to `max_recovery_attempts` times
+3. If all attempts fail → returns `'partial'` (best-effort)
+
+**Best-Effort Reaching:**
+
+When Phase 2 cannot reach the goal (all recovery attempts exhausted), it does NOT abort. Instead:
+- Phase 3 still runs (aligns heading at the closest position)
+- The result reports `success=False` with a descriptive message and the actual `position_error`
+- The caller can decide what to do next (send a different goal, accept partial, etc.)
+
+**Tilt Detection:**
+
+Every tick, the odom quaternion is checked for roll+pitch magnitude. If it exceeds `tilt_threshold_deg` (robot tipping):
+- In sim: calls `/gazebo/set_entity_state` to restore the robot upright at the same (x, y, yaw)
+- On hw: reports failure (cannot physically right the robot)
+
+**Termination:** `dist ≤ position_tolerance` (default 0.05 m = 5 cm sim, 0.03 m hw)
 
 ---
 
@@ -259,13 +290,25 @@ The node also installs `SIGINT`/`SIGTERM` handlers that call `_stop()` before sh
 
 ### Result
 
-On success:
+On full success:
 ```
 result.success        = True
+result.message        = 'Goal reached.'
 result.final_x/y/heading = actual achieved pose from odom
 result.position_error  = hypot(target - achieved)  [m]
 result.heading_error   = |normalize(target_heading - achieved_yaw)|  [rad]
 ```
+
+On partial (best-effort) reach:
+```
+result.success        = False
+result.message        = 'Partial: closest approach X.XXX m from goal ...'
+result.final_x/y/heading = closest position achieved
+result.position_error  = remaining distance to goal  [m]
+result.heading_error   = remaining heading error  [rad]
+```
+
+The robot always attempts Phase 3 (heading alignment) even on partial reach, so `heading_error` is minimised regardless of whether the position was fully reached.
 
 ---
 
@@ -382,18 +425,44 @@ Oscillation can occur when `kp_angular` is too high relative to `max_angular_spe
 
 ## 9. Parameter Summary
 
-| Parameter | Sim (`params_sim.yaml`) | HW (`params_hw.yaml`) | Effect |
-|-----------|-------------------------|----------------------|--------|
-| `max_linear_speed` | 0.18 m/s | 0.18 m/s | Caps Phase 2 forward velocity |
-| `max_angular_speed` | **1.0 rad/s** | 2.0 rad/s | Caps Phases 1 & 3 angular velocity |
+**Core control:**
+
+| Parameter | Sim | HW | Effect |
+|-----------|-----|-----|--------|
+| `max_linear_speed` | 0.12 m/s | 0.18 m/s | Caps Phase 2 forward velocity |
+| `max_angular_speed` | **1.0 rad/s** | 2.0 rad/s | Caps all phases angular velocity |
 | `position_tolerance` | 0.05 m | 0.03 m | Phase 2 exit threshold |
 | `heading_tolerance` | 0.05 rad | 0.03 rad | Phases 1 & 3 exit threshold |
 | `kp_linear` | 1.0 | 1.0 | Phase 2 linear P gain |
-| `kp_angular` | **1.5** | 3.0 | Phases 1, 2, 3 angular P gain |
-| `control_rate` | 30.0 Hz | 30.0 Hz | Loop frequency for all phases |
+| `kp_angular` | **1.5** | 3.0 | All phases angular P gain |
+| `control_rate` | 30.0 Hz | 30.0 Hz | Loop frequency |
+
+**Stuck detection & recovery:**
+
+| Parameter | Sim | HW | Effect |
+|-----------|-----|-----|--------|
+| `stuck_timeout` | 5.0 s | 8.0 s | Grace period before recovery |
+| `stuck_distance` | 0.03 m | 0.03 m | Min progress per timeout |
+| `max_recovery_attempts` | 3 | 3 | Back-up + rotate attempts |
+| `recovery_backup_speed` | 0.05 m/s | 0.05 m/s | Reverse speed |
+| `recovery_backup_time` | 1.5 s | 1.5 s | Reverse duration |
+
+**LiDAR obstacle avoidance:**
+
+| Parameter | Sim | HW | Effect |
+|-----------|-----|-----|--------|
+| `obstacle_distance` | 0.25 m | 0.30 m | Obstacle detection threshold |
+| `obstacle_angle_deg` | 30.0° | 30.0° | Half-angle of forward cone |
+
+**Tilt detection:**
+
+| Parameter | Sim | HW | Effect |
+|-----------|-----|-----|--------|
+| `tilt_threshold_deg` | 40.0° | 40.0° | Roll+pitch = tipped |
+| `use_gazebo_reset` | true | false | Gazebo API to restore upright |
 
 > ⚠️ **Why sim `max_angular_speed` is 1.0 (not 2.84):**  
-> Gazebo's default physics timestep cannot handle sustained commands at the TurtleBot3 hardware maximum. At 2.84 rad/s, the chassis tips, a wheel lifts off the ground, and odometry corrupts — sending the controller into an uncontrolled spin. **Never raise `max_angular_speed` above ~1.2 rad/s in Gazebo.**
+> Gazebo's physics destabilises at 2.84 rad/s. The chassis tips, a wheel lifts, and odometry corrupts. **Never raise above ~1.2 rad/s in Gazebo.**
 
 HW gains are higher than sim because real-world factors require more authority:
 - Floor surface variations (slip, friction)
@@ -407,45 +476,50 @@ HW gains are higher than sim because real-world factors require more authority:
 
 | Limitation | Root Cause | Mitigation |
 |------------|-----------|------------|
-| **No obstacle avoidance** | No `/scan` subscription | Use Nav2 or add safety layer |
-| **Odometry drift** | Dead reckoning accumulates error | Use SLAM for long moves |
+| **Reactive, not global planning** | Gap-finding uses live LiDAR only | Use Nav2 for complex mazes |
+| **Odometry drift** | Dead reckoning accumulates error | Use SLAM (default) for long moves |
 | **P-only control** | No I or D term | Add PID if overshoot is problematic |
-| **Straight-line path only** | No path planner | Use Nav2 for around-obstacle routing |
-| **Single active goal** | Sequential action server | Preemption is supported (new goal cancels old) |
-| **No map-frame support** | Reads `/odom` directly | Integrate SLAM to make `odom` accurate |
+| **Best-effort not optimal** | Closest approach ≠ globally closest reachable | Use Nav2 costmap for optimal routing |
+| **Single active goal** | Sequential action server | Preemption is supported |
+| **Tilt recovery sim-only** | Gazebo API not available on real hardware | Abort on tilt on real hardware |
 
 ---
 
 ## 11. Summary Diagram — Full Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         absolute_move_node                          │
-│                                                                     │
-│  /odom ──► _odom_cb ──► [lock] _x, _y, _yaw                        │
-│                                      │                              │
-│  Action Goal ──► _execute_cb         │                              │
-│                       │              │                              │
-│                  _wait_for_odom ◄────┘                              │
-│                       │                                             │
-│             ┌─────────▼──────────┐                                  │
-│             │  Phase 1           │  ω = clamp(kp_ang × e_head, max) │
-│             │  Rotate to target  │  v = 0                           │
-│             └─────────┬──────────┘                                  │
-│                       │ |e_head| ≤ tol                              │
-│             ┌─────────▼──────────┐                                  │
-│             │  Phase 2           │  v = clamp(kp_lin × d, max)      │
-│             │  Translate         │    × max(0, cos(e_head))         │
-│             │                    │  ω = clamp(kp_ang × e_head, max) │
-│             └─────────┬──────────┘                                  │
-│                       │ d ≤ pos_tol                                 │
-│             ┌─────────▼──────────┐                                  │
-│             │  Phase 3           │  ω = clamp(kp_ang × e_fin, max)  │
-│             │  Final heading     │  v = 0                           │
-│             └─────────┬──────────┘                                  │
-│                       │ |e_fin| ≤ tol                               │
-│                  STOP → Publish Result                               │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         absolute_move_node                           │
+│                                                                      │
+│  /odom ──► _odom_cb ──► [lock] _x, _y, _yaw, _odom_q (tilt check)   │
+│  /scan ──► _scan_cb ──► [lock] _scan (LiDAR for gap-finding)         │
+│                                      │                               │
+│  Action Goal ──► _execute_cb         │                               │
+│                       │              │                               │
+│                  _wait_for_odom ◄────┘                               │
+│                       │                                              │
+│             ┌─────────▼──────────┐                                   │
+│             │  Phase 1           │  ω = clamp(kp_ang × e_head, max)  │
+│             │  Rotate to target  │  v = 0                            │
+│             │  + tilt detection  │                                   │
+│             └─────────┬──────────┘                                   │
+│                       │ |e_head| ≤ tol                               │
+│             ┌─────────▼──────────┐                                   │
+│             │  Phase 2           │  gap = _find_best_gap(goal_dir)   │
+│             │  Translate         │  if gap: steer toward gap @ 50%   │
+│             │  + gap avoidance   │  else: normal P-control           │
+│             │  + stuck recovery  │  stuck? → back up + rotate + retry│
+│             │  + tilt detection  │  exhausted? → 'partial' result    │
+│             └─────────┬──────────┘                                   │
+│                       │ d ≤ pos_tol  OR  'partial'                   │
+│             ┌─────────▼──────────┐                                   │
+│             │  Phase 3           │  ω = clamp(kp_ang × e_fin, max)   │
+│             │  Final heading     │  v = 0                            │
+│             │  + tilt detection  │  (runs even on partial reach)     │
+│             └─────────┬──────────┘                                   │
+│                       │ |e_fin| ≤ tol                                │
+│                  STOP → Publish Result (success or partial)           │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
