@@ -659,7 +659,10 @@ class AbsoluteMoveNode(Node):
     # ------------------------------------------------------------------
 
     def _stop(self):
-        self._cmd_pub.publish(Twist())
+        try:
+            self._cmd_pub.publish(Twist())
+        except Exception:
+            pass  # context may be invalid during shutdown
 
     @staticmethod
     def _clamp(value, limit):
@@ -694,7 +697,10 @@ def main(args=None):
     node = AbsoluteMoveNode()
 
     def _shutdown_handler(signum, frame):
-        node.get_logger().warn('Shutdown signal received.')
+        try:
+            node.get_logger().warn('Shutdown signal received.')
+        except Exception:
+            pass
         node._stop()
         rclpy.try_shutdown()
 
@@ -709,7 +715,10 @@ def main(args=None):
         pass
     finally:
         node._stop()
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
         try:
             rclpy.shutdown()
         except Exception:
