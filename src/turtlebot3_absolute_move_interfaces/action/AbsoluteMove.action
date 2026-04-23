@@ -1,0 +1,21 @@
+# Goal: target pose in the odom frame
+float64 target_x          # meters, X coordinate in odom frame
+float64 target_y          # meters, Y coordinate in odom frame
+float64 target_heading    # radians, heading in odom frame [-pi, pi]
+---
+# Result
+bool success
+string message
+float64 final_x           # meters, achieved X
+float64 final_y           # meters, achieved Y
+float64 final_heading     # radians, achieved heading
+float64 position_error    # meters, remaining position error
+float64 heading_error     # radians, remaining heading error
+---
+# Feedback
+float64 current_x         # meters
+float64 current_y         # meters
+float64 current_heading   # radians
+float64 distance_remaining  # meters
+float64 heading_error     # radians, error to final heading
+string phase              # "rotate_to_target" | "translate" | "final_heading" | "complete"

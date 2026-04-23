@@ -1,0 +1,41 @@
+# ============================================================
+# TurtleBot3 Absolute Move — Hardware Parameters
+# ============================================================
+
+absolute_move_node:
+  ros__parameters:
+
+    # --- Speed limits ---
+    max_linear_speed: 0.18        # m/s
+    max_angular_speed: 2.0        # rad/s
+
+    # --- Tolerances ---
+    position_tolerance: 0.03      # meters (3 cm)
+    heading_tolerance: 0.03       # radians (~1.72°)
+
+    # --- Proportional gains ---
+    kp_linear: 1.0
+    kp_angular: 3.0
+
+    # --- Control loop rate ---
+    control_rate: 30.0            # Hz
+
+    # --- Stuck detection ---
+    stuck_timeout: 8.0            # seconds (longer than sim for real motors/carpet)
+    stuck_distance: 0.03          # metres of progress required per window
+
+    # --- Recovery maneuver (back-up when stuck) ---
+    max_recovery_attempts: 3
+    recovery_backup_speed: 0.05   # m/s backward
+    recovery_backup_time: 1.5     # seconds to reverse
+
+    # --- LiDAR obstacle avoidance ---
+    obstacle_distance: 0.30       # metres (slightly larger margin on real hardware)
+    obstacle_angle_deg: 30.0      # degrees — half-angle of forward detection cone
+
+    # --- Tilt detection (no Gazebo reset on real hardware) ---
+    tilt_threshold_deg: 40.0      # degrees of combined roll+pitch = tipped
+    use_gazebo_reset: false       # false on real hardware
+
+    # --- Real time ---
+    use_sim_time: false

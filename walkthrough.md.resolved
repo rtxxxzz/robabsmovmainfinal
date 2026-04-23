@@ -1,0 +1,108 @@
+# TurtleBot3 Absolute Move — Walkthrough
+
+## Project Tree
+
+```
+robabsmov/
+├── .gitignore
+├── README.md                              # Full documentation
+└── src/
+    ├── turtlebot3_absolute_move_interfaces/  # Custom action IDL
+    │   ├── CMakeLists.txt
+    │   ├── package.xml
+    │   └── action/
+    │       └── AbsoluteMove.action        # Goal/Feedback/Result definition
+    └── turtlebot3_absolute_move/           # Main Python package
+        ├── package.xml
+        ├── setup.py
+        ├── setup.cfg
+        ├── resource/turtlebot3_absolute_move
+        ├── config/
+        │   ├── params_sim.yaml            # Simulation parameters
+        │   ├── params_hw.yaml             # Hardware parameters
+        │   └── absolute_move.rviz         # RViz config
+        ├── launch/
+        │   ├── simulation.launch.py       # Gazebo + node
+        │   ├── hardware.launch.py         # Node only (bringup on SBC)
+        │   └── rviz.launch.py             # RViz viewer
+        └── turtlebot3_absolute_move/
+            ├── __init__.py
+            ├── absolute_move_node.py      # Action server + controller
+            └── absolute_move_client.py    # Interactive CLI client
+```
+
+## What Was Built
+
+### 1. Custom Action Interface (`AbsoluteMove.action`)
+- **Goal**: `target_x`, `target_y`, `target_heading` (radians, odom frame)
+- **Feedback**: current pose, distance remaining, heading error, phase name
+- **Result**: success flag, message, final pose, residual errors
+
+### 2. Absolute Move Node (`absolute_move_node.py`)
+Three-phase proportional controller:
+
+| Phase | What it does |
+|-------|-------------|
+| `rotate_to_target` | Rotate in place to face (target_x, target_y) |
+| `translate` | Drive forward with heading correction; speed reduced by `cos(heading_error)` to prevent arcing |
+| `final_heading` | Rotate in place to desired heading |
+
+Key design decisions:
+- **MultiThreadedExecutor** with `ReentrantCallbackGroup` — odom updates flow while control loop runs
+- **Thread-safe odom** via `threading.Lock`
+- **Clean shutdown** — SIGINT/SIGTERM handlers + `finally` block all publish zero `cmd_vel`
+- **Angle wrapping** via `normalize_angle()` to handle ±π boundary
+- **Heading-dependent speed reduction** — `linear_speed *= cos(heading_error)` prevents the robot from driving fast while facing the wrong direction
+
+### 3. CLI Client (`absolute_move_client.py`)
+- **Interactive mode**: prompts for `x y heading_degrees`, sends action goals
+- **Single-shot mode**: `--goal X Y HEADING_DEG` from the command line
+- Headings are in **degrees** for user convenience (converted to radians internally)
+- Prints real-time feedback with phase, position, and errors
+
+### 4. Launch Files
+- **`simulation.launch.py`**: Includes `turtlebot3_gazebo/empty_world.launch.py` + starts the node with `params_sim.yaml` and `use_sim_time: true`
+- **`hardware.launch.py`**: Starts only the node with `params_hw.yaml` and `use_sim_time: false`
+- **`rviz.launch.py`**: Starts RViz2 with the included config
+
+### 5. Configuration
+- Separate YAML files for sim vs hardware with different gains/tolerances
+- Hardware uses more conservative values (lower speeds, looser tolerances)
+
+## Quick Start Commands
+
+### Build
+```bash
+cd /path/to/robabsmov
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install
+source install/setup.bash
+```
+
+### Simulation
+```bash
+# Terminal 1:
+export TURTLEBOT3_MODEL=burger
+ros2 launch turtlebot3_absolute_move simulation.launch.py
+
+# Terminal 2:
+ros2 run turtlebot3_absolute_move absolute_move_client -- --goal 1.0 0.0 0
+```
+
+### Hardware
+```bash
+# On TurtleBot3 SBC (via SSH):
+export TURTLEBOT3_MODEL=burger
+ros2 launch turtlebot3_bringup robot.launch.py
+
+# On Remote PC — Terminal 1:
+ros2 launch turtlebot3_absolute_move hardware.launch.py
+
+# On Remote PC — Terminal 2:
+ros2 run turtlebot3_absolute_move absolute_move_client
+```
+
+## Validation
+- Tested: project tree completeness ✓
+- Build and runtime testing requires a ROS 2 Humble environment with TurtleBot3 packages installed
+- README includes a full [Validation Checklist](#validation-checklist) section
