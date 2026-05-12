@@ -106,3 +106,18 @@ ros2 run turtlebot3_absolute_move absolute_move_client
 - Tested: project tree completeness ✓
 - Build and runtime testing requires a ROS 2 Humble environment with TurtleBot3 packages installed
 - README includes a full [Validation Checklist](#validation-checklist) section
+
+
+
+
+
+ros2 launch turtlebot3_absolute_move pipeline.launch.py goals_file:=src/turtlebot3_absolute_move/config/goals_example.yaml
+
+source install/setup.bash
+export TURTLEBOT3_MODEL=waffle
+ros2 launch turtlebot3_absolute_move pipeline.launch.py world:=turtlebot3_world x_pose:=-2.0 y_pose:=-0.5
+
+
+export TURTLEBOT3_MODEL=burger
+source install/setup.bash
+ros2 launch turtlebot3_absolute_move pipeline.launch.py world:=turtlebot3_world x_pose:=-2.0 y_pose:=-0.5

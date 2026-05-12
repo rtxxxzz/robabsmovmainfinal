@@ -74,9 +74,11 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('inflation_radius', 0.18)
         self.declare_parameter('path_simplification', True)
         self.declare_parameter('waypoint_spacing', 0.3)
-        self.declare_parameter('unknown_as_free', False)
+        self.declare_parameter('unknown_as_free', True)
         self.declare_parameter('max_replan_attempts', 3)
         self.declare_parameter('waypoint_reached_tolerance', 0.10)
+        self.declare_parameter('max_frontier_skip', 5)
+        self.declare_parameter('frontier_blacklist_radius', 0.3)
 
         self._read_params()
 
@@ -86,6 +88,12 @@ class PipelineOrchestrator(Node):
         self._odom_received = False
         self._latest_map = None
         self._map_received = False
+
+        # Frontier blacklist — unreachable frontiers we should skip
+        self._frontier_blacklist = set()
+
+        # RViz subprocess handle
+        self._rviz_proc = None
 
         # --- Modules ---
         self._explorer = FrontierExplorer(
@@ -130,6 +138,8 @@ class PipelineOrchestrator(Node):
         self._unknown_as_free = self.get_parameter('unknown_as_free').value
         self._max_replan = self.get_parameter('max_replan_attempts').value
         self._wp_tol = self.get_parameter('waypoint_reached_tolerance').value
+        self._max_frontier_skip = self.get_parameter('max_frontier_skip').value
+        self._blacklist_radius = self.get_parameter('frontier_blacklist_radius').value
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -160,7 +170,8 @@ class PipelineOrchestrator(Node):
     # ------------------------------------------------------------------
 
     def run_pipeline(self, goals_file=None, map_file=None,
-                     explore_only=False, save_map_path=None):
+                     explore_only=False, save_map_path=None,
+                     launch_rviz=True):
         """Run the full autonomous pipeline.
 
         Args:
@@ -168,6 +179,7 @@ class PipelineOrchestrator(Node):
             map_file: Path to saved map (skip exploration).
             explore_only: If True, only explore and save the map.
             save_map_path: Path prefix to save the map (e.g. ~/my_map).
+            launch_rviz: If True, auto-launch RViz2 for real-time visualization.
         """
         self.get_logger().info('=' * 60)
         self.get_logger().info('  TurtleBot3 Autonomous Navigation Pipeline')
@@ -176,6 +188,8 @@ class PipelineOrchestrator(Node):
         # --- Wait for systems ---
         if not self._wait_for_systems():
             return
+
+        # RViz is launched by pipeline.launch.py with proper use_sim_time
 
         # --- Phase A: Exploration ---
         if map_file:
@@ -231,14 +245,16 @@ class PipelineOrchestrator(Node):
     # ------------------------------------------------------------------
 
     def _run_exploration(self):
-        """Autonomous frontier-based exploration."""
+        """Autonomous frontier-based exploration with frontier blacklisting."""
         start_time = time.monotonic()
         no_frontier_count = 0
+        consecutive_skips = 0
 
         self.get_logger().info('Starting frontier-based exploration...')
         self.get_logger().info(
             f'Timeout: {self._exploration_timeout:.0f}s, '
-            f'Patience: {self._no_frontier_patience} empty cycles')
+            f'Patience: {self._no_frontier_patience} empty cycles, '
+            f'Max skip: {self._max_frontier_skip}')
 
         exploration_goal_count = 0
 
@@ -256,12 +272,25 @@ class PipelineOrchestrator(Node):
                 continue
 
             cx, cy, _ = self._get_pose()
-            target = self._explorer.find_best_frontier(grid, cx, cy)
+            target = self._explorer.find_best_frontier(
+                grid, cx, cy,
+                blacklist=self._frontier_blacklist,
+                blacklist_radius=self._blacklist_radius)
 
             # Visualise frontiers
             self._publish_frontier_markers(grid)
 
             if target is None:
+                # Check if we have blacklisted frontiers — maybe clear and retry
+                if self._frontier_blacklist:
+                    self.get_logger().info(
+                        f'No non-blacklisted frontiers. '
+                        f'Clearing {len(self._frontier_blacklist)} '
+                        f'blacklisted entries and retrying...')
+                    self._frontier_blacklist.clear()
+                    consecutive_skips = 0
+                    continue
+
                 no_frontier_count += 1
                 progress = self._explorer.get_exploration_progress(grid)
                 self.get_logger().info(
@@ -281,7 +310,8 @@ class PipelineOrchestrator(Node):
 
             self.get_logger().info(
                 f'Exploration goal #{exploration_goal_count}: '
-                f'({gx:.2f}, {gy:.2f})')
+                f'({gx:.2f}, {gy:.2f}) '
+                f'[blacklist: {len(self._frontier_blacklist)}]')
 
             # Publish goal marker for RViz
             self._publish_goal_marker(gx, gy)
@@ -289,10 +319,29 @@ class PipelineOrchestrator(Node):
             # Plan path to frontier
             path = self._plan_path(gx, gy)
             if path is None:
+                # Blacklist this unreachable frontier
+                self._frontier_blacklist.add((round(gx, 2), round(gy, 2)))
+                consecutive_skips += 1
                 self.get_logger().warn(
-                    f'No path to frontier ({gx:.2f}, {gy:.2f}), skipping.')
+                    f'No path to frontier ({gx:.2f}, {gy:.2f}), '
+                    f'blacklisted. ({consecutive_skips}/'
+                    f'{self._max_frontier_skip} skips)')
+
+                if consecutive_skips >= self._max_frontier_skip:
+                    # Too many consecutive skips — clear blacklist and retry
+                    self.get_logger().info(
+                        f'Hit max skip limit ({self._max_frontier_skip}). '
+                        f'Clearing blacklist and retrying...')
+                    self._frontier_blacklist.clear()
+                    consecutive_skips = 0
+                    # Let SLAM update with a longer pause
+                    time.sleep(3.0)
+
                 time.sleep(1.0)
                 continue
+
+            # Successful path found — reset skip counter
+            consecutive_skips = 0
 
             # Execute path via waypoints
             self._execute_waypoints(path, heading_deg=None)
@@ -304,7 +353,8 @@ class PipelineOrchestrator(Node):
             self._get_map()) if self._get_map() else 0.0
         self.get_logger().info(
             f'Exploration finished. Map coverage: {progress*100:.1f}%. '
-            f'Goals executed: {exploration_goal_count}.')
+            f'Goals executed: {exploration_goal_count}. '
+            f'Blacklisted: {len(self._frontier_blacklist)}.')
 
     # ------------------------------------------------------------------
     # Phase B: Path Planning
@@ -537,6 +587,46 @@ class PipelineOrchestrator(Node):
         return goals
 
     # ------------------------------------------------------------------
+    # RViz auto-launch
+    # ------------------------------------------------------------------
+
+    def _launch_rviz(self):
+        """Launch RViz2 with the pipeline config for real-time map visualization."""
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            pkg_share = get_package_share_directory('turtlebot3_absolute_move')
+            rviz_config = os.path.join(pkg_share, 'config', 'pipeline.rviz')
+
+            if not os.path.exists(rviz_config):
+                self.get_logger().warn(
+                    f'RViz config not found: {rviz_config}')
+                return
+
+            self.get_logger().info('Launching RViz2 for real-time visualization...')
+            self._rviz_proc = subprocess.Popen(
+                ['rviz2', '-d', rviz_config,
+                 '--ros-args', '-p', 'use_sim_time:=true'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            self.get_logger().info('  ✓ RViz2 launched — map, scan, path, '
+                                  'frontiers all visible')
+        except Exception as e:
+            self.get_logger().warn(f'Could not launch RViz2: {e}')
+
+    def _kill_rviz(self):
+        """Terminate the auto-launched RViz2 subprocess."""
+        if self._rviz_proc is not None:
+            try:
+                self._rviz_proc.terminate()
+                self._rviz_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._rviz_proc.kill()
+                except Exception:
+                    pass
+            self._rviz_proc = None
+
+    # ------------------------------------------------------------------
     # Map saving
     # ------------------------------------------------------------------
 
@@ -546,8 +636,7 @@ class PipelineOrchestrator(Node):
         try:
             result = subprocess.run(
                 ['ros2', 'run', 'nav2_map_server', 'map_saver_cli',
-                 '-f', path_prefix, '--ros-args', '-p',
-                 'save_map_timeout:=5000'],
+                 '-f', path_prefix],
                 capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
                 self.get_logger().info(
@@ -722,12 +811,17 @@ def main(args=None):
             goals_file=cli_args['goals_file'],
             map_file=cli_args['map_file'],
             explore_only=cli_args['explore_only'],
-            save_map_path=cli_args['save_map'])
+            save_map_path=cli_args['save_map'],
+            launch_rviz=cli_args.get('rviz', True))
     except KeyboardInterrupt:
         pass
     except Exception as e:
         node.get_logger().error(f'Pipeline error: {e}')
     finally:
+        try:
+            node._kill_rviz()
+        except Exception:
+            pass
         try:
             node.destroy_node()
         except Exception:

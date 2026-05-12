@@ -12,10 +12,14 @@ pipeline_node:
     no_frontier_patience: 3         # consecutive empty scans before stopping
 
     # --- A* Path Planning ---
-    inflation_radius: 0.18          # metres (robot radius 0.14 + 0.04 margin)
+    inflation_radius: 0.22          # metres (robot radius 0.14 + 0.08 margin)
     path_simplification: true       # remove collinear intermediate waypoints
     waypoint_spacing: 0.3           # metres — min distance between waypoints
-    unknown_as_free: false          # treat unknown map cells as obstacles
+    unknown_as_free: true           # treat unknown cells as free during exploration
+
+    # --- Frontier Blacklist ---
+    max_frontier_skip: 5            # max consecutive unreachable frontiers before reset
+    frontier_blacklist_radius: 0.3  # metres — tolerance for blacklist matching
 
     # --- Execution ---
     max_replan_attempts: 3          # replan if waypoint execution fails

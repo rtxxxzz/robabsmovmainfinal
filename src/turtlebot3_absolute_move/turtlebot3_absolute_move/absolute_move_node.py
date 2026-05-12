@@ -26,6 +26,7 @@ Tilt detection:
 """
 
 import math
+import os
 import signal
 import threading
 import time
@@ -592,7 +593,7 @@ class AbsoluteMoveNode(Node):
 
         req = SetEntityState.Request()
         req.state = EntityState()
-        req.state.name = 'burger'
+        req.state.name = os.environ.get('TURTLEBOT3_MODEL', 'burger')
         req.state.pose.position.x = x
         req.state.pose.position.y = y
         req.state.pose.position.z = 0.02

@@ -35,8 +35,24 @@ Visualization Manager:
       Enabled: true
       Topic:
         Value: /map
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Update Topic:
+        Value: /map_updates
       Color Scheme: map
       Alpha: 0.7
+      Draw Behind: true
+
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Reliability Policy: Best Effort
+      Size (m): 0.03
+      Color Transformer: FlatColor
+      Color: 255; 0; 0
+      Style: Points
 
     - Class: rviz_default_plugins/Odometry
       Name: Odometry
@@ -45,20 +61,10 @@ Visualization Manager:
         Value: /odom
       Position Tolerance: 0.1
       Angle Tolerance: 0.1
-      Keep: 100
+      Keep: 200
       Shape:
         Value: Arrow
       Color: 0; 255; 0
-
-    - Class: rviz_default_plugins/LaserScan
-      Name: LaserScan
-      Enabled: true
-      Topic:
-        Value: /scan
-      Size (m): 0.03
-      Color Transformer: FlatColor
-      Color: 255; 0; 0
-      Style: Points
 
     - Class: rviz_default_plugins/Path
       Name: Planned Path
@@ -89,15 +95,23 @@ Visualization Manager:
   Tools:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+    - Class: rviz_default_plugins/SetGoal
+      Topic: /goal_pose
   Views:
     Current:
-      Class: rviz_default_plugins/TopDownOrtho
-      Scale: 30
-      X: 0
-      Y: 0
-      Angle: 0
+      Class: rviz_default_plugins/Orbit
+      Distance: 10
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Size: 0.05
       Name: Current View
       Near Clip Distance: 0.01
+      Pitch: 1.5708
+      Yaw: 3.1416
+      Target Frame: base_link
 Window Geometry:
   Width: 1400
   Height: 900

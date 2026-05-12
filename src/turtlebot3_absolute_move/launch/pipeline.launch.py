@@ -205,6 +205,23 @@ def generate_launch_description():
     ld.add_action(abs_move_hw)
 
     # ------------------------------------------------------------------
+    # RViz2 — Real-time map visualization
+    # ------------------------------------------------------------------
+    rviz_config = os.path.join(pkg_share, 'config', 'pipeline.rviz')
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        output='log',
+        arguments=['-d', rviz_config],
+        parameters=[{
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+        }],
+    )
+    ld.add_action(rviz_node)
+
+    # ------------------------------------------------------------------
     # Pipeline Orchestrator Node
     # ------------------------------------------------------------------
     # Build the arguments list for the pipeline node
@@ -238,3 +255,4 @@ def generate_launch_description():
     ld.add_action(pipeline_node)
 
     return ld
+

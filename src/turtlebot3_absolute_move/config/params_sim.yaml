@@ -6,8 +6,8 @@ absolute_move_node:
   ros__parameters:
 
     # --- Speed limits (kept low — prevents Gazebo physics instability) ---
-    max_linear_speed: 0.12        # m/s  (HW max 0.22)
-    max_angular_speed: 1.0        # rad/s (HW max 2.84 — DO NOT raise above 1.2 in sim)
+    max_linear_speed: 0.15        # m/s  (HW max 0.22)
+    max_angular_speed: 0.8        # rad/s (HW max 2.84 — DO NOT raise above 1.0 in sim)
 
     # --- Tolerances ---
     position_tolerance: 0.05      # meters (5 cm)
@@ -29,9 +29,9 @@ absolute_move_node:
     recovery_backup_speed: 0.05   # m/s backward
     recovery_backup_time: 1.5     # seconds to reverse
 
-    # --- LiDAR obstacle avoidance ---
-    obstacle_distance: 0.25       # metres — stop forward motion if obstacle closer
-    obstacle_angle_deg: 30.0      # degrees — half-angle of forward detection cone
+    # --- LiDAR obstacle avoidance (TurtleBot3 Burger, LDS-01/02) ---
+    obstacle_distance: 0.35       # metres — stop forward motion if obstacle closer
+    obstacle_angle_deg: 45.0      # degrees — half-angle of forward detection cone
 
     # --- Tilt / tipover detection & Gazebo reset ---
     tilt_threshold_deg: 40.0      # degrees of combined roll+pitch = tipped

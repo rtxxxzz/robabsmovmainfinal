@@ -46,13 +46,16 @@ class FrontierExplorer:
         self.cost_weight = cost_weight
 
     def find_best_frontier(self, grid_msg: OccupancyGrid,
-                           robot_x: float, robot_y: float):
+                           robot_x: float, robot_y: float,
+                           blacklist=None, blacklist_radius=0.3):
         """Find the best frontier centroid to explore next.
 
         Args:
             grid_msg: The latest OccupancyGrid from SLAM Toolbox.
             robot_x: Robot X position in the map/odom frame (metres).
             robot_y: Robot Y position in the map/odom frame (metres).
+            blacklist: Optional set of (x, y) tuples to skip.
+            blacklist_radius: Distance tolerance for blacklist matching (m).
 
         Returns:
             (goal_x, goal_y) in metres (map frame), or None if no
@@ -91,6 +94,16 @@ class FrontierExplorer:
             # Convert to world (map) coordinates
             world_x = origin_x + (cx + 0.5) * resolution
             world_y = origin_y + (cy + 0.5) * resolution
+
+            # Skip blacklisted frontiers
+            if blacklist:
+                is_blacklisted = False
+                for bx, by in blacklist:
+                    if math.hypot(world_x - bx, world_y - by) < blacklist_radius:
+                        is_blacklisted = True
+                        break
+                if is_blacklisted:
+                    continue
 
             dist = math.hypot(world_x - robot_x, world_y - robot_y)
 

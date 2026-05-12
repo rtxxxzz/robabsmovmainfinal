@@ -29,9 +29,9 @@ absolute_move_node:
     recovery_backup_speed: 0.05   # m/s backward
     recovery_backup_time: 1.5     # seconds to reverse
 
-    # --- LiDAR obstacle avoidance ---
-    obstacle_distance: 0.30       # metres (slightly larger margin on real hardware)
-    obstacle_angle_deg: 30.0      # degrees — half-angle of forward detection cone
+    # --- LiDAR obstacle avoidance (TurtleBot3 Burger, LDS-02: 0.16–8m range) ---
+    obstacle_distance: 0.35       # metres (increased for better clearance)
+    obstacle_angle_deg: 45.0      # degrees — half-angle of forward detection cone
 
     # --- Tilt detection (no Gazebo reset on real hardware) ---
     tilt_threshold_deg: 40.0      # degrees of combined roll+pitch = tipped
