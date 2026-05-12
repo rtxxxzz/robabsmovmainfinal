@@ -237,13 +237,22 @@ def generate_launch_description():
             {'use_sim_time': LaunchConfiguration('use_sim_time')},
         ],
         # Pass goals_file, map_file, explore_only as CLI args
+        # NOTE: Each flag and value must be a separate argument entry
         arguments=[
             PythonExpression([
-                "'--goals ' + '", LaunchConfiguration('goals_file'),
+                "'--goals' if '", LaunchConfiguration('goals_file'),
+                "' else ''"
+            ]),
+            PythonExpression([
+                "'", LaunchConfiguration('goals_file'),
                 "' if '", LaunchConfiguration('goals_file'), "' else ''"
             ]),
             PythonExpression([
-                "'--map ' + '", LaunchConfiguration('map_file'),
+                "'--map' if '", LaunchConfiguration('map_file'),
+                "' else ''"
+            ]),
+            PythonExpression([
+                "'", LaunchConfiguration('map_file'),
                 "' if '", LaunchConfiguration('map_file'), "' else ''"
             ]),
             PythonExpression([

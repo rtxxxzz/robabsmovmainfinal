@@ -1,0 +1,18 @@
+# ============================================================
+# Navigation Goals — TurtleBot3 World
+# ============================================================
+# Coordinates mapped from turtlebot3_world obstacles layout.
+# Use after exploration completes and map is saved.
+#
+# Usage:
+#   export TURTLEBOT3_MODEL=burger
+#   ros2 launch turtlebot3_absolute_move pipeline.launch.py \
+#     world:=turtlebot3_world x_pose:=-2.0 y_pose:=-0.5 \
+#     goals_file:=src/turtlebot3_absolute_move/config/goals_turtlebot3_world.yaml
+
+goals:
+  - [1.0, 0.5, 0]        # Center-right area, face east
+  - [-1.0, 1.0, 90]      # Upper-left area, face north
+  - [1.0, -1.0, -90]     # Lower-right area, face south
+  - [0.0, 0.0, 0]        # Center of world, face east
+  - [-2.0, -0.5, 0]      # Return to start position

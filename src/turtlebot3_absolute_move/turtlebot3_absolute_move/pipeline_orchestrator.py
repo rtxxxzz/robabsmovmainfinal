@@ -548,7 +548,25 @@ class PipelineOrchestrator(Node):
             return []
 
     def _interactive_goals(self):
-        """Prompt user for goals interactively."""
+        """Prompt user for goals interactively.
+
+        NOTE: ``ros2 launch`` does NOT forward stdin to child nodes.
+        If stdin is not a real terminal we skip the interactive prompt
+        and return an empty list so the pipeline finishes cleanly.
+        """
+        import sys
+        if not sys.stdin.isatty():
+            self.get_logger().warn(
+                'stdin is not a terminal (running under ros2 launch). '
+                'Skipping interactive goal input.')
+            self.get_logger().info(
+                'To specify navigation goals, use a goals file:')
+            self.get_logger().info(
+                '  ros2 launch turtlebot3_absolute_move pipeline.launch.py '
+                'goals_file:=src/turtlebot3_absolute_move/config/'
+                'goals_example.yaml world:=turtlebot3_world ...')
+            return []
+
         goals = []
         print('\n' + '=' * 60)
         print('  Enter navigation goals')
