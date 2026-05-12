@@ -1,0 +1,20 @@
+# ============================================================
+# Example Goals File — TurtleBot3 Pipeline
+# ============================================================
+# Each goal: [x_metres, y_metres, heading_degrees]
+#
+# Usage:
+#   ros2 launch turtlebot3_absolute_move pipeline.launch.py goals_file:=goals_example.yaml
+#   ros2 run turtlebot3_absolute_move pipeline -- --goals /path/to/goals_example.yaml
+#
+# Notes:
+#   - Coordinates are in the odom/map frame (metres)
+#   - Heading is in degrees (-180 to 180)
+#   - Goals are executed in order
+#   - The pipeline plans an A* path to each goal
+
+goals:
+  - [1.0, 0.0, 0]        # 1 m forward along X, face 0°
+  - [1.0, 1.0, 90]       # diagonal to (1,1), face 90° (left)
+  - [0.0, 1.0, 180]      # to (0,1), face 180° (backward)
+  - [0.0, 0.0, 0]        # return to origin, face forward

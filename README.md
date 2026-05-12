@@ -24,6 +24,7 @@ Works identically in **Gazebo simulation** and on **real hardware** via the stan
 13. [Validation Checklist](#validation-checklist)
 14. [Troubleshooting](#troubleshooting)
 15. [Known Limitations](#known-limitations)
+16. [Autonomous Pipeline](#autonomous-pipeline)
 
 ---
 
@@ -712,6 +713,217 @@ The node uses relative topic names (`cmd_vel`, `odom`) so they work with or with
 6. **SLAM requires LiDAR**: SLAM Toolbox needs `/scan` data (TurtleBot3 LiDAR). If the LiDAR is not working or `/scan` is not publishing, SLAM will not build a map and the `map → odom` TF will not be published. Disable SLAM with `slam:=false` to fall back to raw odometry.
 
 7. **Tilt recovery is sim-only**: The Gazebo `set_entity_state` API is used to restore the robot when tipped. On real hardware, tilt detection will abort the goal but cannot physically right the robot.
+
+---
+
+## Autonomous Pipeline
+
+The **Autonomous Navigation Pipeline** automates the entire workflow — from SLAM-based mapping to path-planned navigation — with a single command. It works identically in Gazebo simulation and on real hardware.
+
+### Pipeline Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SINGLE COMMAND EXECUTION                         │
+│                                                                     │
+│  Phase A: EXPLORE & MAP (autonomous frontier exploration)           │
+│    └─ Robot drives itself to build a complete SLAM map              │
+│    └─ Uses frontier-based exploration (BFS cluster detection)       │
+│    └─ Stops when no more frontiers or timeout reached               │
+│    └─ Saves the occupancy grid to disk                              │
+│                                                                     │
+│  Phase B: PLAN PATH (A* on the occupancy grid)                      │
+│    └─ Takes goals from YAML file or interactive CLI                 │
+│    └─ Runs A* with obstacle inflation on the SLAM map               │
+│    └─ Produces waypoint sequence with path simplification           │
+│                                                                     │
+│  Phase C: EXECUTE (absolute move with obstacle avoidance)           │
+│    └─ Sends waypoints to the existing absolute_move action server   │
+│    └─ Replans if execution fails (up to max_replan_attempts)        │
+│    └─ Gap-finding + stuck recovery handle local obstacles           │
+│                                                                     │
+│  Repeat Phase B+C for each goal in the list                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline Quick Start
+
+#### Simulation — Explore & Navigate
+
+```bash
+export TURTLEBOT3_MODEL=burger
+source install/setup.bash
+
+# Terminal 1 — Launch the full pipeline (explore, then enter goals interactively):
+ros2 launch turtlebot3_absolute_move pipeline.launch.py
+
+# Terminal 2 — (Optional) RViz with pipeline displays:
+ros2 launch turtlebot3_absolute_move rviz.launch.py use_sim_time:=true
+# Or use the pipeline-specific RViz config:
+rviz2 -d install/turtlebot3_absolute_move/share/turtlebot3_absolute_move/config/pipeline.rviz
+```
+
+#### Simulation — With Predetermined Goals
+
+```bash
+# Navigate to goals defined in a YAML file after exploring:
+ros2 launch turtlebot3_absolute_move pipeline.launch.py \
+  goals_file:=$(ros2 pkg prefix turtlebot3_absolute_move)/share/turtlebot3_absolute_move/config/goals_example.yaml
+
+# Or with the CLI directly:
+ros2 run turtlebot3_absolute_move pipeline -- --goals /path/to/goals.yaml
+```
+
+#### Simulation — With Obstacles
+
+```bash
+# TurtleBot3 World (hexagonal obstacles):
+ros2 launch turtlebot3_absolute_move pipeline.launch.py \
+  world:=turtlebot3_world x_pose:=-2.0 y_pose:=-0.5
+
+# House environment:
+ros2 launch turtlebot3_absolute_move pipeline.launch.py \
+  world:=turtlebot3_house x_pose:=-2.0 y_pose:=-0.5
+```
+
+#### Skip Exploration — Use Saved Map
+
+```bash
+# If you already have a map from a previous run:
+ros2 run turtlebot3_absolute_move pipeline -- --map ~/pipeline_map.yaml --goals goals.yaml
+```
+
+#### Explore Only — Just Build the Map
+
+```bash
+ros2 run turtlebot3_absolute_move pipeline -- --explore-only
+# Map is saved to ~/pipeline_map.pgm + ~/pipeline_map.yaml
+
+# Custom save path:
+ros2 run turtlebot3_absolute_move pipeline -- --explore-only --save-map ~/my_map
+```
+
+#### Hardware Mode
+
+```bash
+# On the SBC (first):
+ssh ubuntu@<TURTLEBOT3_IP>
+export TURTLEBOT3_MODEL=burger
+ros2 launch turtlebot3_bringup robot.launch.py
+
+# On the Remote PC:
+export TURTLEBOT3_MODEL=burger
+source install/setup.bash
+ros2 launch turtlebot3_absolute_move pipeline.launch.py mode:=hardware
+```
+
+### Pipeline Architecture
+
+```
+┌───────────────┐      ┌────────────────────┐      ┌───────────────────────┐
+│  Pipeline     │      │  Frontier Explorer  │      │  Path Planner         │
+│  Orchestrator │─────►│  (in-process)       │      │  (A* on OccGrid)      │
+│               │      │                     │      │  (in-process)         │
+│  • CLI entry  │      │  • /map subscriber  │      │                       │
+│  • Goal mgmt  │      │  • BFS clustering   │      │  • Obstacle inflation │
+│  • Replan     │      │  • Scoring          │      │  • Line-of-sight      │
+└───────┬───────┘      └────────────────────┘      └───────────────────────┘
+        │  AbsoluteMove action
+        ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                     absolute_move_node (EXISTING — UNCHANGED)         │
+│  • 3-phase controller • gap-finding • stuck recovery • tilt detect   │
+└───────────────────────────────────────────────────────────────────────┘
+        │                                        ▲
+        ▼                                        │
+┌─────────────────────┐                ┌──────────────────────┐
+│  TurtleBot3 Base    │──── /scan ────►│  SLAM Toolbox        │
+│  (Gazebo / Real HW) │──── /odom ────►│  (builds /map, TF)   │
+└─────────────────────┘                └──────────────────────┘
+```
+
+### Pipeline Algorithms
+
+#### Frontier Exploration
+
+The exploration phase uses a **frontier-based** algorithm:
+
+1. A **frontier cell** is a free cell (value = 0) adjacent to an unknown cell (value = -1)
+2. Frontier cells are clustered using **BFS flood-fill** on 8-connected neighbours
+3. Clusters smaller than `min_frontier_size` are discarded
+4. Each cluster is scored: `size × 1/(1 + distance × cost_weight)`
+5. The highest-scoring frontier centroid becomes the next exploration goal
+6. A* plans a path to it, absolute_move executes the waypoints
+7. Repeats until no frontiers remain or `exploration_timeout` is reached
+
+#### A* Path Planning
+
+1. The SLAM occupancy grid is **inflated** by `inflation_radius` (robot radius + margin)
+2. A* runs with 8-connected neighbours (diagonal cost = √2, cardinal = 1)
+3. Heuristic: Euclidean distance (admissible, consistent)
+4. The raw path is **simplified** using line-of-sight pruning (Bresenham)
+5. Waypoints are spaced at least `waypoint_spacing` metres apart
+6. If the goal is inside an inflated obstacle, the nearest free cell is used
+
+> For a full algorithm deep-dive, see [pipeline_algorithm.md](pipeline_algorithm.md).
+
+### Pipeline Goals File Format
+
+```yaml
+# goals.yaml — each entry is [x_metres, y_metres, heading_degrees]
+goals:
+  - [1.0, 0.0, 0]        # 1 m forward, face 0°
+  - [1.0, 1.0, 90]       # diagonal to (1,1), face 90°
+  - [0.0, 0.0, 0]        # return to origin
+```
+
+### Pipeline Parameter Reference
+
+| Parameter | Default | Unit | Description |
+|-----------|---------|------|-------------|
+| `min_frontier_size` | 5 | cells | Minimum frontier cluster size |
+| `exploration_timeout` | 300.0 | s | Max exploration time (5 min) |
+| `frontier_cost_weight` | 0.5 | — | Higher = prefer closer frontiers |
+| `no_frontier_patience` | 3 | — | Empty scans before stopping exploration |
+| `inflation_radius` | 0.18 | m | Obstacle inflation (robot radius + margin) |
+| `path_simplification` | true | — | Remove collinear intermediate waypoints |
+| `waypoint_spacing` | 0.3 | m | Min distance between waypoints |
+| `unknown_as_free` | false | — | Treat unknown cells as free space |
+| `max_replan_attempts` | 3 | — | Replanning attempts per goal |
+| `waypoint_reached_tolerance` | 0.10 | m | Tolerance for intermediate waypoints |
+
+### Pipeline RViz Topics
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/planned_path` | `nav_msgs/Path` | A* planned path (green line) |
+| `/frontiers` | `visualization_msgs/MarkerArray` | Frontier cluster centroids (cyan spheres) |
+| `/exploration_goal` | `visualization_msgs/Marker` | Current exploration target (orange arrow) |
+| `/map` | `OccupancyGrid` | SLAM occupancy map |
+
+### Pipeline Troubleshooting
+
+#### Exploration doesn't start
+
+- SLAM must be running: `ros2 node list | grep slam`
+- `/map` must be publishing: `ros2 topic hz /map`
+- `/scan` must have data: `ros2 topic echo /scan --once`
+
+#### Exploration never stops
+
+- Increase `no_frontier_patience` or decrease `exploration_timeout`
+- Small gaps between walls create persistent frontiers — increase `min_frontier_size`
+
+#### A* finds no path
+
+- The goal may be inside an inflated obstacle — try a nearby position
+- The map may not extend to the goal yet — ensure exploration covers the area
+- Decrease `inflation_radius` if the corridors are very narrow
+
+#### Pipeline hangs waiting for action server
+
+- `absolute_move_node` must be running: `ros2 node list | grep absolute_move`
+- Check the action: `ros2 action list`
 
 ---
 

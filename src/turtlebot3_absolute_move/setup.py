@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'absolute_move_node = turtlebot3_absolute_move.absolute_move_node:main',
             'absolute_move_client = turtlebot3_absolute_move.absolute_move_client:main',
+            'pipeline = turtlebot3_absolute_move.pipeline_orchestrator:main',
         ],
     },
 )
