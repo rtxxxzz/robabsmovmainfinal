@@ -10,21 +10,22 @@ Works identically in **Gazebo simulation** and on **real hardware** via the stan
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [SLAM Integration](#slam-integration)
-4. [Absolute Move vs. Relative Move](#absolute-move-vs-relative-move)
-5. [Prerequisites](#prerequisites)
-6. [Build](#build)
-7. [Simulation Mode](#simulation-mode)
-8. [Hardware Mode](#hardware-mode)
-9. [Action Interface Reference](#action-interface-reference)
-10. [CLI Client Usage](#cli-client-usage)
-11. [Configuration & Tuning](#configuration--tuning)
-12. [Coordinate Frames & Odometry](#coordinate-frames--odometry)
-13. [Validation Checklist](#validation-checklist)
-14. [Troubleshooting](#troubleshooting)
-15. [Known Limitations](#known-limitations)
-16. [Autonomous Pipeline](#autonomous-pipeline)
+2. [Theoretical Foundations](theory.md) — Deep-dive into SLAM, absolute move math, and the autonomous pipeline algorithms
+3. [Architecture](#architecture)
+4. [SLAM Integration](#slam-integration)
+5. [Absolute Move vs. Relative Move](#absolute-move-vs-relative-move)
+6. [Prerequisites](#prerequisites)
+7. [Build](#build)
+8. [Simulation Mode](#simulation-mode)
+9. [Hardware Mode](#hardware-mode)
+10. [Action Interface Reference](#action-interface-reference)
+11. [CLI Client Usage](#cli-client-usage-goal_input)
+12. [Configuration & Tuning](#configuration--tuning)
+13. [Coordinate Frames & Odometry](#coordinate-frames--odometry)
+14. [Validation Checklist](#validation-checklist)
+15. [Troubleshooting](#troubleshooting)
+16. [Known Limitations](#known-limitations)
+17. [Autonomous Pipeline](#autonomous-pipeline)
 
 ---
 
@@ -315,33 +316,36 @@ ros2 launch turtlebot3_bringup robot.launch.py
 
 > Leave this terminal open. The robot is now publishing `/odom` and `/scan`, and subscribing to `/cmd_vel`.
 
-### Step 2 — Launch the Absolute Move Node (on Remote PC)
+### Step 2 — Launch the Pipeline (on Remote PC)
+
+The `hardware.launch.py` now perfectly mirrors the simulation pipeline, running SLAM, RViz, and the pipeline orchestrator by default.
 
 ```bash
 export TURTLEBOT3_MODEL=burger
 source install/setup.bash
 
-# Odom-only (default for hardware):
+# Full pipeline (explore + interactive goals):
 ros2 launch turtlebot3_absolute_move hardware.launch.py
 
-# With SLAM on the Remote PC (optional):
-ros2 launch turtlebot3_absolute_move hardware.launch.py slam:=true
-```
+# With a predefined goals file:
+ros2 launch turtlebot3_absolute_move hardware.launch.py goals_file:=goals.yaml
 
-> **Note:** `slam` defaults to `false` on the hardware launch. Enable it with `slam:=true` if you want the Remote PC to run SLAM Toolbox for the real robot.
+# Just absolute_move + SLAM (no pipeline orchestrator):
+ros2 launch turtlebot3_absolute_move hardware.launch.py pipeline:=false
+```
 
 ### Step 3 — Send Goals (on Remote PC, new terminal)
 
 ```bash
 source install/setup.bash
-ros2 run turtlebot3_absolute_move absolute_move_client
+ros2 run turtlebot3_absolute_move goal_input
 ```
 
 ### Step 4 — (Optional) RViz
 
 ```bash
 source install/setup.bash
-ros2 launch turtlebot3_absolute_move rviz.launch.py
+ros2 launch turtlebot3_absolute_move hardware.launch.py rviz:=true
 ```
 
 ### Network Checklist
@@ -402,31 +406,43 @@ ros2 action send_goal /absolute_move_node/absolute_move \
 
 ---
 
-## CLI Client Usage
+## CLI Client Usage (`goal_input`)
 
-The `absolute_move_client` accepts headings in **degrees** for convenience (converted to radians internally).
+The `goal_input` tool acts as a dedicated action client. It accepts headings in **degrees** for convenience (converted to radians internally).
+
+> **NEW:** The interactive client is now **map-aware**. It subscribes to the `/map` and `/odom` topics, and runs A* path planning on the SLAM occupancy grid to find the optimal collision-free path to your goal. It sends a sequence of waypoints to `absolute_move_node`. If no map is available, it gracefully falls back to sending a direct straight-line goal.
 
 ### Interactive Mode
 
-```
-$ ros2 run turtlebot3_absolute_move absolute_move_client
+```bash
+# In a separate terminal while the simulation/robot is running:
+$ ros2 run turtlebot3_absolute_move goal_input
+
+Connecting to absolute_move action server...
+  ✓ Action server connected
+Waiting for /odom...
+  ✓ Odom received — robot at (-1.96, 0.99, 2.2°)
+Waiting for /map...
+  ✓ Map received — 112×103 cells @ 0.05 m/cell
 
 ============================================================
-  TurtleBot3 Absolute Move — Interactive Client
+  Interactive Absolute Move (A* Path Planning)
 ============================================================
-Enter goals as: x y heading_degrees
+Enter goal coordinates to move the robot.
+The robot will plan an optimal path using A* on the SLAM map.
+
+Format:  x y heading_degrees
   Example: 1.0 0.5 90
 Type "quit" or Ctrl+C to exit.
 ============================================================
 
-Goal (x y heading_deg): 1.0 0.0 0
-  [rotate_to_target] pos=(0.000, 0.000) heading=0.0° dist=1.000 m
-  [translate] pos=(0.523, 0.001) heading=0.1° dist=0.477 m
-  ...
-✓ Goal reached: (1.001, 0.002, 0.3°)
-
-Goal (x y heading_deg): 0.0 0.0 180
-  ...
+Goal 1 (x y heading_deg): 1.0 0.5 90
+  → Planning path to (1.00, 0.50, 90.0°)...
+  ✓ A* path planned: 3 waypoints
+    Waypoint 1/3: (-1.18, 0.75, -6.5°)
+    Waypoint 2/3: (0.34, 0.58, -3.1°)
+    Waypoint 3/3: (1.00, 0.50, 90.0°)
+  ✓ Goal reached (0.979, 0.500)
 ```
 
 ### Single-Shot Mode

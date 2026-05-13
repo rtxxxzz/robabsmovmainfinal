@@ -129,3 +129,24 @@ ros2 launch turtlebot3_absolute_move pipeline.launch.py world:=turtlebot3_world 
 
 cd ~/Documents/rob/robabsmovmain && source install/setup.bash
 ros2 run turtlebot3_absolute_move goal_input
+
+
+cd ~/Documents/rob/robabsmovmain && source install/setup.bash
+ros2 run turtlebot3_absolute_move goal_input
+
+
+
+
+Usage on real hardware
+
+
+# On TurtleBot3 SBC (SSH):
+ros2 launch turtlebot3_bringup robot.launch.py
+# On Remote PC — full pipeline (explore + goals):
+ros2 launch turtlebot3_absolute_move hardware.launch.py
+# On Remote PC — with goals file:
+ros2 launch turtlebot3_absolute_move hardware.launch.py goals_file:=goals.yaml
+# On Remote PC — just absolute_move + SLAM (no pipeline):
+ros2 launch turtlebot3_absolute_move hardware.launch.py pipeline:=false
+# On Remote PC — interactive goals (separate terminal):
+ros2 run turtlebot3_absolute_move goal_input

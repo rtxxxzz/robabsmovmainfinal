@@ -1,12 +1,13 @@
 """
-Interactive Goal Input — send absolute move commands from the terminal.
+Interactive Goal Input — map-aware absolute move commands from the terminal.
 
 Run this tool in a SEPARATE terminal while the simulation/robot is running:
 
     ros2 run turtlebot3_absolute_move goal_input
 
-The tool connects to the already-running absolute_move action server
-and lets you type in goal coordinates interactively.
+The tool connects to the running absolute_move action server, subscribes
+to /map and /odom, and uses A* path planning on the SLAM occupancy grid
+to find the optimal collision-free path to each goal.
 
 Workflow:
   Terminal 1:  ros2 launch turtlebot3_absolute_move pipeline.launch.py ...
@@ -14,7 +15,7 @@ Workflow:
                 but gazebo, SLAM, and absolute_move_node keep running)
 
   Terminal 2:  ros2 run turtlebot3_absolute_move goal_input
-               (enter goals interactively; robot moves)
+               (enter goals interactively; robot plans optimal path & moves)
 
   When done:   Ctrl+C Terminal 1 to stop the simulation
 """
@@ -28,9 +29,12 @@ import time
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
+from nav_msgs.msg import OccupancyGrid, Odometry
 from turtlebot3_absolute_move_interfaces.action import AbsoluteMove
+from turtlebot3_absolute_move.path_planner import PathPlanner
 
 
 def _normalize_angle(angle):
@@ -41,16 +45,125 @@ def _normalize_angle(angle):
     return angle
 
 
+def _yaw_from_quaternion(q):
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
 class GoalInputNode(Node):
-    """Lightweight node that sends goals to the absolute_move action server."""
+    """Map-aware interactive goal input node.
+
+    Subscribes to /map and /odom, uses A* path planning on the SLAM
+    occupancy grid, and sends optimal waypoints to absolute_move.
+    """
 
     def __init__(self):
         super().__init__('goal_input_node')
+
+        self._cb_group = ReentrantCallbackGroup()
+
+        # --- State ---
+        self._lock = threading.Lock()
+        self._x = self._y = self._yaw = 0.0
+        self._odom_received = False
+        self._latest_map = None
+        self._map_received = False
+
+        # --- Path planner (same as pipeline) ---
+        self._planner = PathPlanner(
+            inflation_radius=0.18,
+            waypoint_spacing=0.3,
+            unknown_as_free=True,
+            simplify=True)
+
+        # --- ROS interfaces ---
         self._action_client = ActionClient(
             self, AbsoluteMove, '/absolute_move_node/absolute_move')
 
-    def send_goal(self, x, y, heading_deg):
-        """Send a goal and block until result.
+        self.create_subscription(
+            Odometry, 'odom', self._odom_cb, 10,
+            callback_group=self._cb_group)
+
+        self.create_subscription(
+            OccupancyGrid, 'map', self._map_cb, 10,
+            callback_group=self._cb_group)
+
+    def _odom_cb(self, msg):
+        with self._lock:
+            self._x = msg.pose.pose.position.x
+            self._y = msg.pose.pose.position.y
+            self._yaw = _yaw_from_quaternion(msg.pose.pose.orientation)
+            self._odom_received = True
+
+    def _map_cb(self, msg):
+        with self._lock:
+            self._latest_map = msg
+            self._map_received = True
+
+    def _get_pose(self):
+        with self._lock:
+            return self._x, self._y, self._yaw
+
+    def _get_map(self):
+        with self._lock:
+            return self._latest_map
+
+    def plan_and_execute(self, goal_x, goal_y, heading_deg):
+        """Plan an A* path on the map and execute via waypoints.
+
+        Returns:
+            (success, final_x, final_y, message)
+        """
+        grid = self._get_map()
+        cx, cy, cyaw = self._get_pose()
+
+        if grid is None:
+            print('  ⚠ No /map received — falling back to direct move')
+            return self._send_direct_goal(goal_x, goal_y, heading_deg)
+
+        # Plan path using A*
+        path = self._planner.plan(grid, cx, cy, goal_x, goal_y)
+
+        if path is None:
+            print('  ⚠ A* found no path — falling back to direct move')
+            return self._send_direct_goal(goal_x, goal_y, heading_deg)
+
+        print(f'  ✓ A* path planned: {len(path)} waypoints')
+
+        # Execute waypoints sequentially
+        for i, (wx, wy) in enumerate(path):
+            is_last = (i == len(path) - 1)
+
+            # Intermediate waypoints: heading toward next waypoint
+            # Final waypoint: user-specified heading
+            if is_last:
+                h_rad = math.radians(heading_deg)
+            elif i < len(path) - 1:
+                nx, ny = path[i + 1]
+                h_rad = math.atan2(ny - wy, nx - wx)
+            else:
+                h_rad = 0.0
+
+            print(f'    Waypoint {i+1}/{len(path)}: '
+                  f'({wx:.2f}, {wy:.2f}, {math.degrees(h_rad):.1f}°)')
+
+            success, fx, fy, msg = self._send_single_goal(wx, wy, h_rad)
+
+            if not success and is_last:
+                return False, fx, fy, msg
+            # For intermediate waypoints, partial success is OK
+
+        # Return result of the final waypoint
+        return success, fx, fy, msg
+
+    def _send_direct_goal(self, x, y, heading_deg):
+        """Send a single direct goal (no path planning)."""
+        h_rad = math.radians(heading_deg)
+        return self._send_single_goal(x, y, h_rad)
+
+    def _send_single_goal(self, x, y, heading_rad):
+        """Send a single goal to the action server and wait for result.
 
         Returns:
             (success, final_x, final_y, message)
@@ -58,7 +171,7 @@ class GoalInputNode(Node):
         goal_msg = AbsoluteMove.Goal()
         goal_msg.target_x = x
         goal_msg.target_y = y
-        goal_msg.target_heading = _normalize_angle(math.radians(heading_deg))
+        goal_msg.target_heading = _normalize_angle(heading_rad)
 
         done_event = threading.Event()
         result_holder = [None]
@@ -84,7 +197,7 @@ class GoalInputNode(Node):
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(result_cb)
 
-        # Wait for result (up to 120 s per goal)
+        # Wait for result (up to 120 s per waypoint)
         done_event.wait(timeout=120.0)
 
         if result_holder[0] is None:
@@ -98,7 +211,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = GoalInputNode()
 
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
@@ -116,18 +229,43 @@ def main(args=None):
     print('Connecting to absolute_move action server...')
     if not node._action_client.wait_for_server(timeout_sec=15.0):
         print('ERROR: absolute_move action server not available!')
-        print('Make sure the simulation/robot is running:')
-        print('  ros2 launch turtlebot3_absolute_move pipeline.launch.py '
-              'world:=turtlebot3_world ...')
+        print('Make sure the simulation/robot is running.')
         rclpy.try_shutdown()
         spin_thread.join(timeout=2.0)
         return
-    print('Connected!\n')
+    print('  ✓ Action server connected')
 
+    # Wait for odom
+    print('Waiting for /odom...')
+    deadline = time.monotonic() + 10.0
+    while not node._odom_received and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if node._odom_received:
+        cx, cy, cyaw = node._get_pose()
+        print(f'  ✓ Odom received — robot at ({cx:.2f}, {cy:.2f}, '
+              f'{math.degrees(cyaw):.1f}°)')
+    else:
+        print('  ⚠ No /odom yet — will retry when sending goals')
+
+    # Wait for map
+    print('Waiting for /map...')
+    deadline = time.monotonic() + 10.0
+    while not node._map_received and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if node._map_received:
+        grid = node._get_map()
+        print(f'  ✓ Map received — {grid.info.width}×{grid.info.height} '
+              f'cells @ {grid.info.resolution:.2f} m/cell')
+    else:
+        print('  ⚠ No /map received — will use direct moves (no A* planning)')
+
+    print()
     print('=' * 60)
-    print('  Interactive Absolute Move')
+    print('  Interactive Absolute Move (A* Path Planning)')
     print('=' * 60)
     print('Enter goal coordinates to move the robot.')
+    print('The robot will plan an optimal path using A* on the SLAM map.')
+    print()
     print('Format:  x y heading_degrees')
     print('  Example: 1.0 0.5 90')
     print('  Example: -2.0 1.0 0')
@@ -152,7 +290,6 @@ def main(args=None):
 
             parts = line.split()
             if len(parts) == 2:
-                # Allow omitting heading (default 0)
                 parts.append('0')
             if len(parts) != 3:
                 print('  ⚠ Enter 2 or 3 values: x y [heading_degrees]')
@@ -166,12 +303,12 @@ def main(args=None):
                 continue
 
             goal_count += 1
-            print(f'  → Moving to ({x:.2f}, {y:.2f}, {h:.1f}°)...')
+            print(f'  → Planning path to ({x:.2f}, {y:.2f}, {h:.1f}°)...')
 
-            success, fx, fy, msg = node.send_goal(x, y, h)
+            success, fx, fy, msg = node.plan_and_execute(x, y, h)
 
             if success:
-                print(f'  ✓ Reached ({fx:.3f}, {fy:.3f})')
+                print(f'  ✓ Goal reached ({fx:.3f}, {fy:.3f})')
             else:
                 print(f'  ✗ Failed: {msg}')
             print()
@@ -179,7 +316,7 @@ def main(args=None):
     except KeyboardInterrupt:
         print('\nExiting.')
 
-    print(f'Total goals sent: {goal_count}')
+    print(f'Total goals executed: {goal_count}')
 
     try:
         node.destroy_node()
