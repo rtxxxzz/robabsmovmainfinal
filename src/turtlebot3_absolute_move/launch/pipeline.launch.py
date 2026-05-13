@@ -106,6 +106,11 @@ def generate_launch_description():
         'explore_only', default_value='false',
         description='Only explore and save map, do not navigate'))
 
+    ld.add_action(DeclareLaunchArgument(
+        'skip_exploration', default_value='auto',
+        description='Skip exploration: auto (detect existing map), '
+                    'true (always skip), false (always explore)'))
+
     ld.add_action(SetEnvironmentVariable(
         name='TURTLEBOT3_MODEL', value=tb3_model))
 
@@ -158,16 +163,28 @@ def generate_launch_description():
         ld.add_action(spawn)
 
     # ------------------------------------------------------------------
-    # SLAM Toolbox (always on — needed for exploration)
+    # SLAM Toolbox (always on — mapping or localization)
     # ------------------------------------------------------------------
+    # When a map_file is provided, use localization mode;
+    # otherwise use mapping mode for exploration.
     if slam_toolbox_pkg:
+        slam_params_loc = os.path.join(
+            pkg_share, 'config', 'params_slam_localization.yaml')
+
+        # Use localization config when map_file is provided
+        slam_config = PythonExpression([
+            "'", slam_params_loc, "' if '",
+            LaunchConfiguration('map_file'), "' else '",
+            slam_params, "'"
+        ])
+
         slam = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(slam_toolbox_pkg, 'launch',
                              'online_async_launch.py')),
             launch_arguments={
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
-                'slam_params_file': slam_params,
+                'slam_params_file': slam_config,
             }.items())
         ld.add_action(slam)
     else:
@@ -236,7 +253,7 @@ def generate_launch_description():
             params_pipeline,
             {'use_sim_time': LaunchConfiguration('use_sim_time')},
         ],
-        # Pass goals_file, map_file, explore_only as CLI args
+        # Pass goals_file, map_file, explore_only, skip_exploration as CLI args
         # NOTE: Each flag and value must be a separate argument entry
         arguments=[
             PythonExpression([
@@ -259,6 +276,8 @@ def generate_launch_description():
                 "'--explore-only' if '",
                 LaunchConfiguration('explore_only'), "' == 'true' else ''"
             ]),
+            '--skip-exploration',
+            LaunchConfiguration('skip_exploration'),
         ],
     )
     ld.add_action(pipeline_node)

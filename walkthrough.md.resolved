@@ -121,3 +121,11 @@ ros2 launch turtlebot3_absolute_move pipeline.launch.py world:=turtlebot3_world 
 export TURTLEBOT3_MODEL=burger
 source install/setup.bash
 ros2 launch turtlebot3_absolute_move pipeline.launch.py world:=turtlebot3_world x_pose:=-2.0 y_pose:=-0.5
+
+
+ros2 launch turtlebot3_absolute_move pipeline.launch.py world:=turtlebot3_world x_pose:=-2.0 y_pose:=-0.5
+
+
+
+cd ~/Documents/rob/robabsmovmain && source install/setup.bash
+ros2 run turtlebot3_absolute_move goal_input

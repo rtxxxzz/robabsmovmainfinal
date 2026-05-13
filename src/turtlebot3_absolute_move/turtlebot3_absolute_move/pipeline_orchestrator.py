@@ -80,6 +80,11 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('max_frontier_skip', 5)
         self.declare_parameter('frontier_blacklist_radius', 0.3)
 
+        # Map auto-detection parameters
+        self.declare_parameter('map_save_dir', '~/')
+        self.declare_parameter('map_save_prefix', 'pipeline_map')
+        self.declare_parameter('auto_detect_map', True)
+
         self._read_params()
 
         # --- State ---
@@ -140,6 +145,9 @@ class PipelineOrchestrator(Node):
         self._wp_tol = self.get_parameter('waypoint_reached_tolerance').value
         self._max_frontier_skip = self.get_parameter('max_frontier_skip').value
         self._blacklist_radius = self.get_parameter('frontier_blacklist_radius').value
+        self._map_save_dir = self.get_parameter('map_save_dir').value
+        self._map_save_prefix = self.get_parameter('map_save_prefix').value
+        self._auto_detect_enabled = self.get_parameter('auto_detect_map').value
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -171,7 +179,7 @@ class PipelineOrchestrator(Node):
 
     def run_pipeline(self, goals_file=None, map_file=None,
                      explore_only=False, save_map_path=None,
-                     launch_rviz=True):
+                     launch_rviz=True, skip_exploration=None):
         """Run the full autonomous pipeline.
 
         Args:
@@ -180,6 +188,10 @@ class PipelineOrchestrator(Node):
             explore_only: If True, only explore and save the map.
             save_map_path: Path prefix to save the map (e.g. ~/my_map).
             launch_rviz: If True, auto-launch RViz2 for real-time visualization.
+            skip_exploration: 'auto' (default), 'true', or 'false'.
+                - 'auto': auto-detect existing map; skip if found.
+                - 'true': always skip exploration (error if no map).
+                - 'false': always explore (ignore existing maps).
         """
         self.get_logger().info('=' * 60)
         self.get_logger().info('  TurtleBot3 Autonomous Navigation Pipeline')
@@ -189,19 +201,48 @@ class PipelineOrchestrator(Node):
         if not self._wait_for_systems():
             return
 
+        # --- Map auto-detection ---
+        # Resolve skip_exploration mode
+        if skip_exploration is None or skip_exploration == 'auto':
+            # Auto-detect: check for existing map
+            if map_file:
+                should_skip = True
+                detected_map = map_file
+            else:
+                detected_map = self._auto_detect_map()
+                should_skip = detected_map is not None
+        elif skip_exploration == 'true':
+            should_skip = True
+            detected_map = map_file or self._auto_detect_map()
+            if detected_map is None:
+                self.get_logger().error(
+                    'skip_exploration=true but no map found! '
+                    'Run exploration first or provide map_file.')
+                return
+        else:  # 'false'
+            should_skip = False
+            detected_map = None
+
         # RViz is launched by pipeline.launch.py with proper use_sim_time
 
-        # --- Phase A: Exploration ---
-        if map_file:
-            self.get_logger().info(f'Skipping exploration — using map: {map_file}')
-            self.get_logger().info('Waiting for SLAM to load map data...')
+        # --- Phase A: Exploration or Skip ---
+        if should_skip:
+            self.get_logger().info('')
+            self.get_logger().info('-' * 50)
+            self.get_logger().info('  ✓ MAP AUTO-DETECTED — Skipping Exploration')
+            self.get_logger().info(f'    Map: {detected_map}')
+            self.get_logger().info('-' * 50)
+            self.get_logger().info('Waiting for SLAM/map data...')
             # Wait for map topic to start publishing
             timeout = time.monotonic() + 30.0
             while not self._map_received and time.monotonic() < timeout:
                 time.sleep(0.5)
             if not self._map_received:
                 self.get_logger().warn(
-                    'No /map received. Path planning may not work without a map.')
+                    'No /map received within 30s. '
+                    'SLAM may still be loading. Proceeding anyway...')
+            else:
+                self.get_logger().info('  ✓ Map topic active')
         else:
             self.get_logger().info('')
             self.get_logger().info('-' * 50)
@@ -210,7 +251,9 @@ class PipelineOrchestrator(Node):
             self._run_exploration()
 
             # Save the map
-            save_path = save_map_path or os.path.expanduser('~/pipeline_map')
+            save_dir = os.path.expanduser(self._map_save_dir)
+            save_path = save_map_path or os.path.join(
+                save_dir, self._map_save_prefix)
             self._save_map(save_path)
 
         if explore_only:
@@ -518,6 +561,41 @@ class PipelineOrchestrator(Node):
         self.get_logger().info('  All systems ready.')
         return True
 
+    def _auto_detect_map(self):
+        """Check well-known paths for an existing saved map.
+
+        Returns the map YAML path if found, or None.
+        """
+        if not self._auto_detect_enabled:
+            return None
+
+        save_dir = os.path.expanduser(self._map_save_dir)
+        prefix = self._map_save_prefix
+        map_yaml = os.path.join(save_dir, prefix + '.yaml')
+        map_pgm = os.path.join(save_dir, prefix + '.pgm')
+
+        self.get_logger().info('Auto-detecting existing map...')
+        self.get_logger().info(f'  Checking: {map_yaml}')
+
+        if os.path.isfile(map_yaml) and os.path.isfile(map_pgm):
+            # Check file age for informational purposes
+            age_seconds = time.time() - os.path.getmtime(map_yaml)
+            age_hours = age_seconds / 3600.0
+
+            if age_hours > 24.0:
+                self.get_logger().warn(
+                    f'  Map is {age_hours:.1f} hours old. '
+                    f'Consider re-exploring with skip_exploration:=false')
+            else:
+                self.get_logger().info(
+                    f'  Map age: {age_hours:.1f} hours')
+
+            self.get_logger().info(f'  ✓ Found: {map_yaml} ({map_pgm})')
+            return map_yaml
+
+        self.get_logger().info('  No existing map found — will explore.')
+        return None
+
     # ------------------------------------------------------------------
     # Goal loading
     # ------------------------------------------------------------------
@@ -780,6 +858,7 @@ def _parse_args(argv):
         'map_file': None,
         'explore_only': False,
         'save_map': None,
+        'skip_exploration': 'auto',
     }
     i = 0
     while i < len(argv):
@@ -794,6 +873,9 @@ def _parse_args(argv):
             i += 1
         elif argv[i] == '--save-map' and i + 1 < len(argv):
             args['save_map'] = argv[i + 1]
+            i += 2
+        elif argv[i] == '--skip-exploration' and i + 1 < len(argv):
+            args['skip_exploration'] = argv[i + 1]  # 'auto', 'true', 'false'
             i += 2
         else:
             i += 1
@@ -830,7 +912,8 @@ def main(args=None):
             map_file=cli_args['map_file'],
             explore_only=cli_args['explore_only'],
             save_map_path=cli_args['save_map'],
-            launch_rviz=cli_args.get('rviz', True))
+            launch_rviz=cli_args.get('rviz', True),
+            skip_exploration=cli_args['skip_exploration'])
     except KeyboardInterrupt:
         pass
     except Exception as e:
