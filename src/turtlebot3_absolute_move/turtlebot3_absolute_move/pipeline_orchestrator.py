@@ -84,6 +84,8 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('map_save_dir', '~/')
         self.declare_parameter('map_save_prefix', 'pipeline_map')
         self.declare_parameter('auto_detect_map', True)
+        self.declare_parameter('map_validation_threshold', 0.30)
+        self.declare_parameter('map_validation_wait', 15.0)
 
         self._read_params()
 
@@ -148,6 +150,8 @@ class PipelineOrchestrator(Node):
         self._map_save_dir = self.get_parameter('map_save_dir').value
         self._map_save_prefix = self.get_parameter('map_save_prefix').value
         self._auto_detect_enabled = self.get_parameter('auto_detect_map').value
+        self._map_validation_threshold = self.get_parameter('map_validation_threshold').value
+        self._map_validation_wait = self.get_parameter('map_validation_wait').value
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -229,10 +233,10 @@ class PipelineOrchestrator(Node):
         if should_skip:
             self.get_logger().info('')
             self.get_logger().info('-' * 50)
-            self.get_logger().info('  ✓ MAP AUTO-DETECTED — Skipping Exploration')
+            self.get_logger().info('  MAP AUTO-DETECTED — Validating...')
             self.get_logger().info(f'    Map: {detected_map}')
             self.get_logger().info('-' * 50)
-            self.get_logger().info('Waiting for SLAM/map data...')
+            self.get_logger().info('Waiting for SLAM/map data to validate...')
             # Wait for map topic to start publishing
             timeout = time.monotonic() + 30.0
             while not self._map_received and time.monotonic() < timeout:
@@ -243,6 +247,19 @@ class PipelineOrchestrator(Node):
                     'SLAM may still be loading. Proceeding anyway...')
             else:
                 self.get_logger().info('  ✓ Map topic active')
+                # Validate: does the saved map match the current environment?
+                if not self._validate_map_against_environment(detected_map):
+                    self.get_logger().warn('')
+                    self.get_logger().warn('=' * 50)
+                    self.get_logger().warn(
+                        '  ✗ SAVED MAP DOES NOT MATCH CURRENT ENVIRONMENT')
+                    self.get_logger().warn(
+                        '    Discarding saved map → starting exploration')
+                    self.get_logger().warn('=' * 50)
+                    should_skip = False
+                else:
+                    self.get_logger().info('')
+                    self.get_logger().info('  ✓ Map validated — environment matches')
         else:
             self.get_logger().info('')
             self.get_logger().info('-' * 50)
@@ -595,6 +612,211 @@ class PipelineOrchestrator(Node):
 
         self.get_logger().info('  No existing map found — will explore.')
         return None
+
+    def _validate_map_against_environment(self, map_yaml_path):
+        """Validate that a saved map matches the current environment.
+
+        Strategy:
+          1. Load the saved map PGM image (from the YAML metadata).
+          2. Wait for the live SLAM map to have enough explored area.
+          3. Extract occupied cells from both maps in the overlapping
+             region and compute their structural overlap.
+          4. If the overlap ratio exceeds map_validation_threshold,
+             the maps describe the same environment.
+
+        Returns:
+            True  — saved map matches the current environment.
+            False — saved map does NOT match (different environment).
+        """
+        import numpy as np
+
+        # --- Load the saved map ---
+        try:
+            saved_grid = self._load_saved_map_as_grid(map_yaml_path)
+        except Exception as e:
+            self.get_logger().error(f'  Failed to load saved map: {e}')
+            return False
+
+        if saved_grid is None:
+            return False
+
+        saved_data, saved_w, saved_h, saved_res, saved_ox, saved_oy = saved_grid
+
+        self.get_logger().info(
+            f'  Saved map: {saved_w}×{saved_h} cells, '
+            f'resolution={saved_res:.3f} m/cell')
+
+        # --- Wait for live SLAM to build enough of the map ---
+        self.get_logger().info(
+            f'  Waiting {self._map_validation_wait:.0f}s '
+            f'for SLAM to observe the environment...')
+        time.sleep(self._map_validation_wait)
+
+        live_map = self._get_map()
+        if live_map is None:
+            self.get_logger().warn('  No live map available for validation.')
+            return True  # Can't validate → assume OK
+
+        live_data = np.array(live_map.data, dtype=np.int8).reshape(
+            (live_map.info.height, live_map.info.width))
+        live_res = live_map.info.resolution
+        live_ox = live_map.info.origin.position.x
+        live_oy = live_map.info.origin.position.y
+        live_w = live_map.info.width
+        live_h = live_map.info.height
+
+        self.get_logger().info(
+            f'  Live map:  {live_w}×{live_h} cells, '
+            f'resolution={live_res:.3f} m/cell')
+
+        # --- Compare occupied cells in the overlapping region ---
+        # Find the overlapping world-coordinate bounding box
+        saved_max_x = saved_ox + saved_w * saved_res
+        saved_max_y = saved_oy + saved_h * saved_res
+        live_max_x = live_ox + live_w * live_res
+        live_max_y = live_oy + live_h * live_res
+
+        overlap_min_x = max(saved_ox, live_ox)
+        overlap_min_y = max(saved_oy, live_oy)
+        overlap_max_x = min(saved_max_x, live_max_x)
+        overlap_max_y = min(saved_max_y, live_max_y)
+
+        if overlap_max_x <= overlap_min_x or overlap_max_y <= overlap_min_y:
+            self.get_logger().warn('  No overlap between saved and live maps.')
+            return False
+
+        # Extract occupied cells from both maps in the overlap region
+        # Use the live map resolution for the comparison grid
+        res = live_res
+        comp_w = int((overlap_max_x - overlap_min_x) / res)
+        comp_h = int((overlap_max_y - overlap_min_y) / res)
+
+        if comp_w < 5 or comp_h < 5:
+            self.get_logger().warn('  Overlap region too small to validate.')
+            return True  # Not enough data → assume OK
+
+        saved_occupied = 0
+        live_occupied = 0
+        both_occupied = 0
+        live_known = 0
+
+        for r in range(comp_h):
+            for c in range(comp_w):
+                wx = overlap_min_x + (c + 0.5) * res
+                wy = overlap_min_y + (r + 0.5) * res
+
+                # Saved map cell
+                sc = int((wx - saved_ox) / saved_res)
+                sr = int((wy - saved_oy) / saved_res)
+                if 0 <= sr < saved_h and 0 <= sc < saved_w:
+                    s_val = saved_data[sr, sc]
+                else:
+                    s_val = -1
+
+                # Live map cell
+                lc = int((wx - live_ox) / live_res)
+                lr = int((wy - live_oy) / live_res)
+                if 0 <= lr < live_h and 0 <= lc < live_w:
+                    l_val = live_data[lr, lc]
+                else:
+                    l_val = -1
+
+                s_occ = (s_val >= 50)
+                l_occ = (l_val >= 50)
+                l_known = (l_val >= 0)  # free or occupied
+
+                if l_known:
+                    live_known += 1
+                if s_occ:
+                    saved_occupied += 1
+                if l_occ:
+                    live_occupied += 1
+                if s_occ and l_occ:
+                    both_occupied += 1
+
+        # Compute match ratio
+        # Use the minimum of saved/live occupied cells as denominator
+        # This handles partial live maps (robot hasn't explored everything)
+        denom = min(saved_occupied, live_occupied)
+        if denom == 0:
+            if live_known < 50:
+                self.get_logger().warn(
+                    '  Live map has too few known cells — cannot validate.')
+                return True  # Not enough data
+            if saved_occupied == 0 and live_occupied == 0:
+                # Both maps have no obstacles in the overlap — could be empty world
+                self.get_logger().info(
+                    '  Both maps show no obstacles in overlap — match.')
+                return True
+            # One has obstacles, the other doesn't
+            self.get_logger().warn(
+                f'  Mismatch: saved_occ={saved_occupied}, '
+                f'live_occ={live_occupied}')
+            return False
+
+        match_ratio = both_occupied / denom
+        self.get_logger().info(
+            f'  Validation: saved_occ={saved_occupied}, '
+            f'live_occ={live_occupied}, '
+            f'overlap={both_occupied}, '
+            f'match={match_ratio:.1%} '
+            f'(threshold={self._map_validation_threshold:.0%})')
+
+        return match_ratio >= self._map_validation_threshold
+
+    def _load_saved_map_as_grid(self, map_yaml_path):
+        """Load a saved map YAML+PGM and return as numpy grid.
+
+        Returns:
+            (data_2d, width, height, resolution, origin_x, origin_y)
+            or None on failure.
+        """
+        import numpy as np
+        from PIL import Image
+
+        with open(map_yaml_path, 'r') as f:
+            meta = yaml.safe_load(f)
+
+        pgm_path = meta.get('image', '')
+        if not os.path.isabs(pgm_path):
+            pgm_path = os.path.join(
+                os.path.dirname(map_yaml_path), pgm_path)
+
+        if not os.path.isfile(pgm_path):
+            self.get_logger().error(f'  Map image not found: {pgm_path}')
+            return None
+
+        resolution = float(meta.get('resolution', 0.05))
+        origin = meta.get('origin', [0.0, 0.0, 0.0])
+        origin_x, origin_y = float(origin[0]), float(origin[1])
+        negate = int(meta.get('negate', 0))
+        occ_thresh = float(meta.get('occupied_thresh', 0.65))
+        free_thresh = float(meta.get('free_thresh', 0.196))
+
+        # Load PGM as grayscale
+        img = Image.open(pgm_path).convert('L')
+        pixels = np.array(img, dtype=np.float64)
+        height, width = pixels.shape
+
+        # Convert pixel values to occupancy probabilities
+        # Per ROS map_server convention:
+        #   p = (255 - pixel) / 255  (if negate=0)
+        #   p = pixel / 255          (if negate=1)
+        if negate:
+            prob = pixels / 255.0
+        else:
+            prob = (255.0 - pixels) / 255.0
+
+        # Convert to OccupancyGrid-style values
+        data = np.full((height, width), -1, dtype=np.int8)
+        data[prob >= occ_thresh] = 100   # occupied
+        data[prob <= free_thresh] = 0    # free
+        # Everything else remains -1 (unknown)
+
+        # Flip vertically (PGM is stored top-down, OccupancyGrid is bottom-up)
+        data = np.flipud(data)
+
+        return data, width, height, resolution, origin_x, origin_y
 
     # ------------------------------------------------------------------
     # Goal loading
