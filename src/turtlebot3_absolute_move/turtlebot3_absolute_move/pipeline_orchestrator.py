@@ -1,7 +1,7 @@
 """
 Pipeline Orchestrator — Autonomous navigation pipeline for TurtleBot3.
 
-Orchestrates the full workflow: SLAM exploration → A* path planning →
+Orchestrates the full workflow: SLAM exploration → Dijkstra path planning →
 absolute move execution. Works in both Gazebo simulation and real hardware.
 
 Usage:
@@ -36,9 +36,13 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
 
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from nav_msgs.msg import OccupancyGrid, Path
 from visualization_msgs.msg import Marker, MarkerArray
 
 from turtlebot3_absolute_move_interfaces.action import AbsoluteMove
@@ -70,6 +74,7 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('min_frontier_size', 5)
         self.declare_parameter('exploration_timeout', 300.0)
         self.declare_parameter('frontier_cost_weight', 0.5)
+        self.declare_parameter('min_frontier_distance', 0.25)
         self.declare_parameter('no_frontier_patience', 3)
         self.declare_parameter('inflation_radius', 0.18)
         self.declare_parameter('path_simplification', True)
@@ -84,20 +89,20 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('map_save_dir', '~/')
         self.declare_parameter('map_save_prefix', 'pipeline_map')
         self.declare_parameter('auto_detect_map', True)
-        self.declare_parameter('map_validation_threshold', 0.30)
-        self.declare_parameter('map_validation_wait', 15.0)
 
         self._read_params()
 
         # --- State ---
         self._lock = threading.Lock()
-        self._x = self._y = self._yaw = 0.0
-        self._odom_received = False
         self._latest_map = None
         self._map_received = False
 
         # Frontier blacklist — unreachable frontiers we should skip
         self._frontier_blacklist = set()
+
+        # Recently visited locations — prevents frontier ping-pong
+        self._visited_locations = []
+        self._visit_radius = 0.50  # metres — covers explored frontier area
 
         # RViz subprocess handle
         self._rviz_proc = None
@@ -105,22 +110,37 @@ class PipelineOrchestrator(Node):
         # --- Modules ---
         self._explorer = FrontierExplorer(
             min_frontier_size=self._min_frontier_size,
-            cost_weight=self._frontier_cost_weight)
+            cost_weight=self._frontier_cost_weight,
+            min_distance=self._min_frontier_distance)
         self._planner = PathPlanner(
             inflation_radius=self._inflation_radius,
             waypoint_spacing=self._waypoint_spacing,
             unknown_as_free=self._unknown_as_free,
             simplify=self._path_simplification)
 
+        # --- TF2 for map-frame localization ---
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(
+            self._tf_buffer, self)
+
         # --- ROS interfaces ---
         self._cb_group = ReentrantCallbackGroup()
 
-        self.create_subscription(
-            Odometry, 'odom', self._odom_cb, 10,
+        # slam_toolbox publishes /map with TRANSIENT_LOCAL durability.
+        # We MUST match that, otherwise the subscriber never connects.
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1)
+
+        self._map_sub = self.create_subscription(
+            OccupancyGrid, '/map', self._map_cb, map_qos,
             callback_group=self._cb_group)
-        self.create_subscription(
-            OccupancyGrid, 'map', self._map_cb, 10,
-            callback_group=self._cb_group)
+        self.get_logger().info(
+            f'Subscribed to /map with QoS: '
+            f'reliability={map_qos.reliability}, '
+            f'durability={map_qos.durability}')
 
         self._action_client = ActionClient(
             self, AbsoluteMove, '/absolute_move_node/absolute_move')
@@ -138,6 +158,7 @@ class PipelineOrchestrator(Node):
         self._min_frontier_size = self.get_parameter('min_frontier_size').value
         self._exploration_timeout = self.get_parameter('exploration_timeout').value
         self._frontier_cost_weight = self.get_parameter('frontier_cost_weight').value
+        self._min_frontier_distance = self.get_parameter('min_frontier_distance').value
         self._no_frontier_patience = self.get_parameter('no_frontier_patience').value
         self._inflation_radius = self.get_parameter('inflation_radius').value
         self._path_simplification = self.get_parameter('path_simplification').value
@@ -150,28 +171,68 @@ class PipelineOrchestrator(Node):
         self._map_save_dir = self.get_parameter('map_save_dir').value
         self._map_save_prefix = self.get_parameter('map_save_prefix').value
         self._auto_detect_enabled = self.get_parameter('auto_detect_map').value
-        self._map_validation_threshold = self.get_parameter('map_validation_threshold').value
-        self._map_validation_wait = self.get_parameter('map_validation_wait').value
 
     # ------------------------------------------------------------------
-    # Callbacks
+    # Callbacks & TF helpers
     # ------------------------------------------------------------------
-
-    def _odom_cb(self, msg):
-        with self._lock:
-            self._x = msg.pose.pose.position.x
-            self._y = msg.pose.pose.position.y
-            self._yaw = _yaw_from_quaternion(msg.pose.pose.orientation)
-            self._odom_received = True
 
     def _map_cb(self, msg):
         with self._lock:
+            first_time = not self._map_received
             self._latest_map = msg
             self._map_received = True
+        if first_time:
+            self.get_logger().info(
+                f'✓ First /map received! '
+                f'Size: {msg.info.width}x{msg.info.height}, '
+                f'resolution: {msg.info.resolution}')
 
     def _get_pose(self):
-        with self._lock:
-            return self._x, self._y, self._yaw
+        """Get robot pose in the MAP frame via TF2."""
+        try:
+            t = self._tf_buffer.lookup_transform(
+                'map', 'base_footprint',
+                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            yaw = _yaw_from_quaternion(t.transform.rotation)
+            return x, y, yaw
+        except Exception:
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    'map', 'base_link',
+                    rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
+                x = t.transform.translation.x
+                y = t.transform.translation.y
+                yaw = _yaw_from_quaternion(t.transform.rotation)
+                return x, y, yaw
+            except Exception:
+                return 0.0, 0.0, 0.0
+
+    def _map_to_odom(self, map_x, map_y, map_yaw):
+        """Transform a map-frame pose to the odom frame for the action server.
+
+        NOTE: This is only used when the absolute_move_node is NOT using
+        TF-based pose (use_tf_pose=false).  When TF pose is enabled (default),
+        waypoints are sent directly in the map frame.
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                'odom', 'map',
+                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
+            # Apply transform: rotate then translate
+            tx = t.transform.translation.x
+            ty = t.transform.translation.y
+            tyaw = _yaw_from_quaternion(t.transform.rotation)
+            cos_t = math.cos(tyaw)
+            sin_t = math.sin(tyaw)
+            odom_x = cos_t * map_x - sin_t * map_y + tx
+            odom_y = sin_t * map_x + cos_t * map_y + ty
+            odom_yaw = _normalize_angle(map_yaw + tyaw)
+            return odom_x, odom_y, odom_yaw
+        except Exception as e:
+            self.get_logger().warn(f'map→odom TF failed: {e}; sending map coords')
+            return map_x, map_y, map_yaw
 
     def _get_map(self):
         with self._lock:
@@ -233,10 +294,10 @@ class PipelineOrchestrator(Node):
         if should_skip:
             self.get_logger().info('')
             self.get_logger().info('-' * 50)
-            self.get_logger().info('  MAP AUTO-DETECTED — Validating...')
+            self.get_logger().info('  ✓ MAP AUTO-DETECTED — Skipping Exploration')
             self.get_logger().info(f'    Map: {detected_map}')
             self.get_logger().info('-' * 50)
-            self.get_logger().info('Waiting for SLAM/map data to validate...')
+            self.get_logger().info('Waiting for SLAM/map data...')
             # Wait for map topic to start publishing
             timeout = time.monotonic() + 30.0
             while not self._map_received and time.monotonic() < timeout:
@@ -247,19 +308,6 @@ class PipelineOrchestrator(Node):
                     'SLAM may still be loading. Proceeding anyway...')
             else:
                 self.get_logger().info('  ✓ Map topic active')
-                # Validate: does the saved map match the current environment?
-                if not self._validate_map_against_environment(detected_map):
-                    self.get_logger().warn('')
-                    self.get_logger().warn('=' * 50)
-                    self.get_logger().warn(
-                        '  ✗ SAVED MAP DOES NOT MATCH CURRENT ENVIRONMENT')
-                    self.get_logger().warn(
-                        '    Discarding saved map → starting exploration')
-                    self.get_logger().warn('=' * 50)
-                    should_skip = False
-                else:
-                    self.get_logger().info('')
-                    self.get_logger().info('  ✓ Map validated — environment matches')
         else:
             self.get_logger().info('')
             self.get_logger().info('-' * 50)
@@ -317,8 +365,9 @@ class PipelineOrchestrator(Node):
             f'Max skip: {self._max_frontier_skip}')
 
         exploration_goal_count = 0
+        consecutive_failures = 0  # track failures for recovery
 
-        while True:
+        while rclpy.ok():
             elapsed = time.monotonic() - start_time
             if elapsed > self._exploration_timeout:
                 self.get_logger().info(
@@ -331,11 +380,13 @@ class PipelineOrchestrator(Node):
                 time.sleep(2.0)
                 continue
 
-            cx, cy, _ = self._get_pose()
+            cx, cy, cyaw = self._get_pose()
             target = self._explorer.find_best_frontier(
                 grid, cx, cy,
                 blacklist=self._frontier_blacklist,
-                blacklist_radius=self._blacklist_radius)
+                blacklist_radius=self._blacklist_radius,
+                visited_locations=self._visited_locations,
+                visit_radius=self._visit_radius)
 
             # Visualise frontiers
             self._publish_frontier_markers(grid)
@@ -404,7 +455,33 @@ class PipelineOrchestrator(Node):
             consecutive_skips = 0
 
             # Execute path via waypoints
-            self._execute_waypoints(path, heading_deg=None)
+            success = self._execute_waypoints(path, heading_deg=None)
+
+            # Mark this frontier AND the actual robot position as explored
+            self._visited_locations.append((gx, gy))
+            cx_now, cy_now, _ = self._get_pose()
+            self._visited_locations.append((cx_now, cy_now))
+
+            if success:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                self.get_logger().warn(
+                    f'Waypoint execution failed '
+                    f'({consecutive_failures} consecutive). '
+                    f'Settling for 3s...')
+                time.sleep(3.0)
+
+                # After 3+ consecutive failures, do a recovery spin
+                # to give SLAM fresh scan matches
+                if consecutive_failures >= 3:
+                    self.get_logger().warn(
+                        'Multiple consecutive failures. '
+                        'Blacklisting frontier and pausing...')
+                    self._frontier_blacklist.add(
+                        (round(gx, 2), round(gy, 2)))
+                    consecutive_failures = 0
+                    time.sleep(3.0)
 
             # Brief pause to let SLAM update
             time.sleep(1.0)
@@ -436,7 +513,7 @@ class PipelineOrchestrator(Node):
                 f'Path planned: {len(path)} waypoints')
         else:
             self.get_logger().warn(
-                f'A* found no path to ({goal_x:.2f}, {goal_y:.2f})')
+                f'Dijkstra found no path to ({goal_x:.2f}, {goal_y:.2f})')
         return path
 
     # ------------------------------------------------------------------
@@ -471,9 +548,9 @@ class PipelineOrchestrator(Node):
     def _execute_waypoints(self, path, heading_deg=None):
         """Send waypoints one-by-one to the absolute_move action server.
 
-        For intermediate waypoints, the heading is set to point toward
-        the next waypoint.  For the final waypoint, heading_deg is used
-        (or 0 if None).
+        Waypoints arrive in the MAP frame from Dijkstra.  Since the
+        AbsoluteMove node now uses TF-based pose (map frame), we send
+        map-frame coordinates directly.  No frame conversion needed.
         """
         if not path:
             return False
@@ -484,7 +561,6 @@ class PipelineOrchestrator(Node):
             if is_last and heading_deg is not None:
                 h_rad = math.radians(heading_deg)
             elif not is_last:
-                # Point toward the next waypoint
                 nx, ny = path[i + 1]
                 h_rad = math.atan2(ny - wy, nx - wx)
             else:
@@ -494,10 +570,10 @@ class PipelineOrchestrator(Node):
                 f'  Waypoint {i+1}/{len(path)}: '
                 f'({wx:.2f}, {wy:.2f}, {math.degrees(h_rad):.1f}°)')
 
+            # Send map-frame coordinates directly
             success = self._send_absolute_move(wx, wy, h_rad)
             if not success and is_last:
                 return False
-            # For intermediate waypoints, partial success is acceptable
 
         return True
 
@@ -548,6 +624,16 @@ class PipelineOrchestrator(Node):
         else:
             self.get_logger().warn(f'  ✗ {result.message}')
 
+        # Sanity check: if the reported position is wildly off,
+        # odometry has been corrupted (wheel slippage).
+        if result.position_error > 10.0:
+            self.get_logger().error(
+                f'ODOM CORRUPTION DETECTED: position_error='
+                f'{result.position_error:.1f}m. '
+                f'Reported pos: ({result.final_x:.1f}, {result.final_y:.1f}). '
+                f'Halting exploration — robot needs manual restart.')
+            return False
+
         return result.success
 
     # ------------------------------------------------------------------
@@ -555,17 +641,36 @@ class PipelineOrchestrator(Node):
     # ------------------------------------------------------------------
 
     def _wait_for_systems(self):
-        """Wait for odom and action server to be ready."""
+        """Wait for TF tree and action server to be ready."""
         self.get_logger().info('Waiting for systems...')
 
-        # Wait for odom
+        # Wait for TF tree (map → base_footprint)
+        tf_ok = False
         timeout = time.monotonic() + 15.0
-        while not self._odom_received and time.monotonic() < timeout:
-            time.sleep(0.2)
-        if not self._odom_received:
-            self.get_logger().error('No /odom received — is the robot running?')
+        while time.monotonic() < timeout:
+            try:
+                self._tf_buffer.lookup_transform(
+                    'map', 'base_footprint',
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5))
+                tf_ok = True
+                break
+            except Exception:
+                try:
+                    self._tf_buffer.lookup_transform(
+                        'map', 'base_link',
+                        rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=0.5))
+                    tf_ok = True
+                    break
+                except Exception:
+                    time.sleep(0.2)
+        if not tf_ok:
+            self.get_logger().error(
+                'TF map→base_footprint not available — '
+                'is the robot and SLAM running?')
             return False
-        self.get_logger().info('  ✓ Odometry received')
+        self.get_logger().info('  ✓ TF tree received')
 
         # Wait for action server
         if not self._action_client.wait_for_server(timeout_sec=15.0):
@@ -612,211 +717,6 @@ class PipelineOrchestrator(Node):
 
         self.get_logger().info('  No existing map found — will explore.')
         return None
-
-    def _validate_map_against_environment(self, map_yaml_path):
-        """Validate that a saved map matches the current environment.
-
-        Strategy:
-          1. Load the saved map PGM image (from the YAML metadata).
-          2. Wait for the live SLAM map to have enough explored area.
-          3. Extract occupied cells from both maps in the overlapping
-             region and compute their structural overlap.
-          4. If the overlap ratio exceeds map_validation_threshold,
-             the maps describe the same environment.
-
-        Returns:
-            True  — saved map matches the current environment.
-            False — saved map does NOT match (different environment).
-        """
-        import numpy as np
-
-        # --- Load the saved map ---
-        try:
-            saved_grid = self._load_saved_map_as_grid(map_yaml_path)
-        except Exception as e:
-            self.get_logger().error(f'  Failed to load saved map: {e}')
-            return False
-
-        if saved_grid is None:
-            return False
-
-        saved_data, saved_w, saved_h, saved_res, saved_ox, saved_oy = saved_grid
-
-        self.get_logger().info(
-            f'  Saved map: {saved_w}×{saved_h} cells, '
-            f'resolution={saved_res:.3f} m/cell')
-
-        # --- Wait for live SLAM to build enough of the map ---
-        self.get_logger().info(
-            f'  Waiting {self._map_validation_wait:.0f}s '
-            f'for SLAM to observe the environment...')
-        time.sleep(self._map_validation_wait)
-
-        live_map = self._get_map()
-        if live_map is None:
-            self.get_logger().warn('  No live map available for validation.')
-            return True  # Can't validate → assume OK
-
-        live_data = np.array(live_map.data, dtype=np.int8).reshape(
-            (live_map.info.height, live_map.info.width))
-        live_res = live_map.info.resolution
-        live_ox = live_map.info.origin.position.x
-        live_oy = live_map.info.origin.position.y
-        live_w = live_map.info.width
-        live_h = live_map.info.height
-
-        self.get_logger().info(
-            f'  Live map:  {live_w}×{live_h} cells, '
-            f'resolution={live_res:.3f} m/cell')
-
-        # --- Compare occupied cells in the overlapping region ---
-        # Find the overlapping world-coordinate bounding box
-        saved_max_x = saved_ox + saved_w * saved_res
-        saved_max_y = saved_oy + saved_h * saved_res
-        live_max_x = live_ox + live_w * live_res
-        live_max_y = live_oy + live_h * live_res
-
-        overlap_min_x = max(saved_ox, live_ox)
-        overlap_min_y = max(saved_oy, live_oy)
-        overlap_max_x = min(saved_max_x, live_max_x)
-        overlap_max_y = min(saved_max_y, live_max_y)
-
-        if overlap_max_x <= overlap_min_x or overlap_max_y <= overlap_min_y:
-            self.get_logger().warn('  No overlap between saved and live maps.')
-            return False
-
-        # Extract occupied cells from both maps in the overlap region
-        # Use the live map resolution for the comparison grid
-        res = live_res
-        comp_w = int((overlap_max_x - overlap_min_x) / res)
-        comp_h = int((overlap_max_y - overlap_min_y) / res)
-
-        if comp_w < 5 or comp_h < 5:
-            self.get_logger().warn('  Overlap region too small to validate.')
-            return True  # Not enough data → assume OK
-
-        saved_occupied = 0
-        live_occupied = 0
-        both_occupied = 0
-        live_known = 0
-
-        for r in range(comp_h):
-            for c in range(comp_w):
-                wx = overlap_min_x + (c + 0.5) * res
-                wy = overlap_min_y + (r + 0.5) * res
-
-                # Saved map cell
-                sc = int((wx - saved_ox) / saved_res)
-                sr = int((wy - saved_oy) / saved_res)
-                if 0 <= sr < saved_h and 0 <= sc < saved_w:
-                    s_val = saved_data[sr, sc]
-                else:
-                    s_val = -1
-
-                # Live map cell
-                lc = int((wx - live_ox) / live_res)
-                lr = int((wy - live_oy) / live_res)
-                if 0 <= lr < live_h and 0 <= lc < live_w:
-                    l_val = live_data[lr, lc]
-                else:
-                    l_val = -1
-
-                s_occ = (s_val >= 50)
-                l_occ = (l_val >= 50)
-                l_known = (l_val >= 0)  # free or occupied
-
-                if l_known:
-                    live_known += 1
-                if s_occ:
-                    saved_occupied += 1
-                if l_occ:
-                    live_occupied += 1
-                if s_occ and l_occ:
-                    both_occupied += 1
-
-        # Compute match ratio
-        # Use the minimum of saved/live occupied cells as denominator
-        # This handles partial live maps (robot hasn't explored everything)
-        denom = min(saved_occupied, live_occupied)
-        if denom == 0:
-            if live_known < 50:
-                self.get_logger().warn(
-                    '  Live map has too few known cells — cannot validate.')
-                return True  # Not enough data
-            if saved_occupied == 0 and live_occupied == 0:
-                # Both maps have no obstacles in the overlap — could be empty world
-                self.get_logger().info(
-                    '  Both maps show no obstacles in overlap — match.')
-                return True
-            # One has obstacles, the other doesn't
-            self.get_logger().warn(
-                f'  Mismatch: saved_occ={saved_occupied}, '
-                f'live_occ={live_occupied}')
-            return False
-
-        match_ratio = both_occupied / denom
-        self.get_logger().info(
-            f'  Validation: saved_occ={saved_occupied}, '
-            f'live_occ={live_occupied}, '
-            f'overlap={both_occupied}, '
-            f'match={match_ratio:.1%} '
-            f'(threshold={self._map_validation_threshold:.0%})')
-
-        return match_ratio >= self._map_validation_threshold
-
-    def _load_saved_map_as_grid(self, map_yaml_path):
-        """Load a saved map YAML+PGM and return as numpy grid.
-
-        Returns:
-            (data_2d, width, height, resolution, origin_x, origin_y)
-            or None on failure.
-        """
-        import numpy as np
-        from PIL import Image
-
-        with open(map_yaml_path, 'r') as f:
-            meta = yaml.safe_load(f)
-
-        pgm_path = meta.get('image', '')
-        if not os.path.isabs(pgm_path):
-            pgm_path = os.path.join(
-                os.path.dirname(map_yaml_path), pgm_path)
-
-        if not os.path.isfile(pgm_path):
-            self.get_logger().error(f'  Map image not found: {pgm_path}')
-            return None
-
-        resolution = float(meta.get('resolution', 0.05))
-        origin = meta.get('origin', [0.0, 0.0, 0.0])
-        origin_x, origin_y = float(origin[0]), float(origin[1])
-        negate = int(meta.get('negate', 0))
-        occ_thresh = float(meta.get('occupied_thresh', 0.65))
-        free_thresh = float(meta.get('free_thresh', 0.196))
-
-        # Load PGM as grayscale
-        img = Image.open(pgm_path).convert('L')
-        pixels = np.array(img, dtype=np.float64)
-        height, width = pixels.shape
-
-        # Convert pixel values to occupancy probabilities
-        # Per ROS map_server convention:
-        #   p = (255 - pixel) / 255  (if negate=0)
-        #   p = pixel / 255          (if negate=1)
-        if negate:
-            prob = pixels / 255.0
-        else:
-            prob = (255.0 - pixels) / 255.0
-
-        # Convert to OccupancyGrid-style values
-        data = np.full((height, width), -1, dtype=np.int8)
-        data[prob >= occ_thresh] = 100   # occupied
-        data[prob <= free_thresh] = 0    # free
-        # Everything else remains -1 (unknown)
-
-        # Flip vertically (PGM is stored top-down, OccupancyGrid is bottom-up)
-        data = np.flipud(data)
-
-        return data, width, height, resolution, origin_x, origin_y
 
     # ------------------------------------------------------------------
     # Goal loading

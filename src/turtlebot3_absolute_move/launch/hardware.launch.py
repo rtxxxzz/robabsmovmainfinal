@@ -109,6 +109,23 @@ def generate_launch_description():
                     'true (always skip), false (always explore)'))
 
     # ------------------------------------------------------------------
+    # Scan Relay — Bridge Best Effort /scan → Reliable /scan_reliable
+    # The TurtleBot3 LDS driver publishes /scan with Best Effort QoS.
+    # SLAM Toolbox subscribes with Reliable QoS (hardcoded).
+    # This relay bridges the QoS gap.
+    # ------------------------------------------------------------------
+    ld.add_action(Node(
+        package='turtlebot3_absolute_move',
+        executable='scan_relay',
+        name='scan_relay',
+        output='log',
+        parameters=[{
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+        }],
+        condition=IfCondition(LaunchConfiguration('slam')),
+    ))
+
+    # ------------------------------------------------------------------
     # SLAM Toolbox — Online Async (default: enabled)
     # ------------------------------------------------------------------
     if slam_toolbox_pkg:

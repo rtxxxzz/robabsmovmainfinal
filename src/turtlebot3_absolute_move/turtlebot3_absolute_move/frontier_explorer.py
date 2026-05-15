@@ -34,28 +34,34 @@ _NEIGHBOURS = [(-1, -1), (-1, 0), (-1, 1),
 class FrontierExplorer:
     """Stateless frontier detection and scoring on an OccupancyGrid."""
 
-    def __init__(self, min_frontier_size=5, cost_weight=0.5):
+    def __init__(self, min_frontier_size=5, cost_weight=0.5, min_distance=0.25):
         """
         Args:
             min_frontier_size: Minimum number of cells in a frontier
                 cluster to be considered valid.
             cost_weight: Weighting factor for distance vs. size.
                 Higher values favour closer frontiers over larger ones.
+            min_distance: Minimum distance (m) from the robot. Frontiers
+                closer than this are ignored (usually robot blind spots).
         """
         self.min_frontier_size = min_frontier_size
         self.cost_weight = cost_weight
+        self.min_distance = min_distance
 
     def find_best_frontier(self, grid_msg: OccupancyGrid,
                            robot_x: float, robot_y: float,
-                           blacklist=None, blacklist_radius=0.3):
+                           blacklist=None, blacklist_radius=0.3,
+                           visited_locations=None, visit_radius=0.35):
         """Find the best frontier centroid to explore next.
 
         Args:
             grid_msg: The latest OccupancyGrid from SLAM Toolbox.
-            robot_x: Robot X position in the map/odom frame (metres).
-            robot_y: Robot Y position in the map/odom frame (metres).
+            robot_x: Robot X position in the map frame (metres).
+            robot_y: Robot Y position in the map frame (metres).
             blacklist: Optional set of (x, y) tuples to skip.
             blacklist_radius: Distance tolerance for blacklist matching (m).
+            visited_locations: List of (x, y) recently visited positions.
+            visit_radius: Distance within which a frontier is penalized.
 
         Returns:
             (goal_x, goal_y) in metres (map frame), or None if no
@@ -86,6 +92,9 @@ class FrontierExplorer:
         best_score = -1.0
         best_centroid = None
 
+        if visited_locations is None:
+            visited_locations = []
+
         for cluster in clusters:
             # Centroid in grid coordinates
             cy = sum(r for r, c in cluster) / len(cluster)
@@ -107,10 +116,23 @@ class FrontierExplorer:
 
             dist = math.hypot(world_x - robot_x, world_y - robot_y)
 
+            if dist < self.min_distance:
+                continue
+
             # Score: larger frontiers are better, closer is better
             size_score = len(cluster)
             dist_score = 1.0 / (1.0 + dist * self.cost_weight)
             score = size_score * dist_score
+
+            # Skip frontiers near recently visited locations (already explored)
+            is_visited = False
+            for vx, vy in visited_locations:
+                vdist = math.hypot(world_x - vx, world_y - vy)
+                if vdist < visit_radius:
+                    is_visited = True
+                    break
+            if is_visited:
+                continue
 
             if score > best_score:
                 best_score = score
@@ -183,8 +205,8 @@ class FrontierExplorer:
         """
         frontier = np.zeros((height, width), dtype=bool)
 
-        # Only look at free cells (value 0 in OccupancyGrid = definitely free)
-        free_mask = (data == 0)
+        # Only look at free cells (value 0-19 in OccupancyGrid = likely free)
+        free_mask = (data >= 0) & (data < 20)
 
         for dr, dc in _NEIGHBOURS:
             # Shift the data array by (dr, dc) and check for unknown

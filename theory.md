@@ -100,36 +100,14 @@ When navigating to a distant goal (either a frontier or a user goal), the robot 
    *   $h(n)$: The heuristic. We use **Euclidean distance** to the goal. Because Euclidean distance never overestimates the true cost, the heuristic is *admissible*, guaranteeing A* finds the shortest possible path.
 3. **Path Simplification**: The raw A* output follows the grid (resulting in zig-zag paths). The planner uses a **Bresenham line-of-sight** algorithm to remove redundant intermediate waypoints, resulting in a smooth, direct path consisting of minimal waypoints.
 
-### 3.3 Environment Verification (Map Validation)
-A critical real-world problem: what if a saved map exists on disk, but the robot is now in a **completely different environment**? Blindly trusting the saved map would cause the robot to navigate using an incorrect representation of the world — potentially driving into walls or off ledges.
-
-The pipeline solves this with an **Occupied Cell Overlap** validation:
-
-1. **Load the saved map** from its PGM image file.
-2. **Wait for the live SLAM map** (default: 15 seconds) so the robot's LiDAR can observe its surroundings.
-3. **Find the overlapping region** between the saved and live maps in world coordinates.
-4. **Extract occupied cells** (walls, obstacles) from both maps within that overlap.
-5. **Compute the match ratio**: $$\text{match} = \frac{\text{cells occupied in BOTH maps}}{\min(\text{saved occupied}, \text{live occupied})}$$
-6. If the match ratio is **below the threshold** (default: 30%), the saved map is **rejected** and the robot starts fresh exploration.
-
-Using `min()` as the denominator is important because the live map is always smaller than the saved map (the robot has only observed a small area around its starting position). This prevents false negatives from partial coverage.
-
-| Scenario | Saved Occupied | Live Occupied | Both | Match | Decision |
-|----------|---------------|---------------|------|-------|----------|
-| Same room, same position | 200 | 80 | 65 | 65/80 = 81% | ✓ Accept |
-| Same room, different start | 200 | 60 | 40 | 40/60 = 67% | ✓ Accept |
-| Different room entirely | 200 | 90 | 5 | 5/90 = 6% | ✗ Reject → re-explore |
-| Empty world (no obstacles) | 0 | 0 | 0 | N/A | ✓ Accept (both empty) |
-
-### 3.4 The Orchestrator Workflow
+### 3.3 The Orchestrator Workflow
 The `pipeline_orchestrator` ties everything together:
-1. **Auto-Detect Map**: Checks if a saved map file exists on disk.
-2. **Environment Validation**: If a map is found, compares its structure against the live SLAM data. If the environment doesn't match, the saved map is discarded.
-3. **Exploration Phase** (if no valid map): Repeatedly runs the Frontier Explorer, plans paths to the frontiers using A*, and sends the waypoints to the `absolute_move_node`.
-4. **Map Saving**: Once exploration is complete, it saves the map to disk using `nav2_map_server`.
-5. **Goal Execution Phase**: Accepts user goals (either from a YAML file or interactively via the `goal_input` tool), runs A* on the complete map, and executes the paths.
+1. **Auto-Detect Map**: Checks if a saved map exists.
+2. **Exploration Phase** (if no map): Repeatedly runs the Frontier Explorer, plans paths to the frontiers using A*, and sends the waypoints to the `absolute_move_node`.
+3. **Map Saving**: Once exploration is complete, it saves the map to disk using `nav2_map_server`.
+4. **Goal Execution Phase**: Accepts user goals (either from a YAML file or interactively via the `goal_input` tool), runs A* on the complete map, and executes the paths.
 
-### 3.5 Interactive Goal Input Workflow
+### 3.4 Interactive Goal Input Workflow
 The user interacts with the system using two terminals:
 1. **Terminal 1**: Runs the pipeline (`ros2 launch turtlebot3_absolute_move pipeline.launch.py`). This manages SLAM, Gazebo, and the `absolute_move_node`.
 2. **Terminal 2**: Runs the interactive tool (`ros2 run turtlebot3_absolute_move goal_input`).

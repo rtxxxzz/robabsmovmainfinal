@@ -37,9 +37,12 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+import tf2_ros
+
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
+from rclpy.qos import qos_profile_sensor_data
 
 from turtlebot3_absolute_move_interfaces.action import AbsoluteMove
 
@@ -97,6 +100,7 @@ class AbsoluteMoveNode(Node):
         self.declare_parameter('obstacle_angle_deg',  30.0)
         self.declare_parameter('tilt_threshold_deg',  40.0)
         self.declare_parameter('use_gazebo_reset',    True)
+        self.declare_parameter('use_tf_pose',         True)
 
         self._read_params()
 
@@ -106,6 +110,17 @@ class AbsoluteMoveNode(Node):
         self._x = self._y = self._yaw = 0.0
         self._odom_q = None
         self._scan = None
+        # Per-message odom sanity: track last accepted odom timestamp
+        self._last_odom_time = None
+        self._odom_max_speed = 1.0  # m/s — reject if implied speed exceeds this
+        self._consecutive_odom_rejects = 0
+        self._max_consecutive_odom_rejects = 20  # after this many, accept new baseline
+        self._last_valid_odom_time = None  # wall-clock time of last accepted odom
+
+        # --- TF2 for SLAM-corrected pose ---
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(
+            self._tf_buffer, self)
 
         # --- ROS interfaces ---
         self._cb_group = ReentrantCallbackGroup()
@@ -116,7 +131,7 @@ class AbsoluteMoveNode(Node):
             callback_group=self._cb_group)
 
         self.create_subscription(
-            LaserScan, 'scan', self._scan_cb, 10,
+            LaserScan, 'scan', self._scan_cb, qos_profile_sensor_data,
             callback_group=self._cb_group)
 
         self._reset_client = None
@@ -156,6 +171,7 @@ class AbsoluteMoveNode(Node):
         self._tilt_threshold = math.radians(
             self.get_parameter('tilt_threshold_deg').value)
         self._use_gazebo_reset = self.get_parameter('use_gazebo_reset').value
+        self._use_tf_pose = self.get_parameter('use_tf_pose').value
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -163,17 +179,88 @@ class AbsoluteMoveNode(Node):
 
     def _odom_cb(self, msg: Odometry):
         with self._lock:
-            self._x   = msg.pose.pose.position.x
-            self._y   = msg.pose.pose.position.y
+            nx = msg.pose.pose.position.x
+            ny = msg.pose.pose.position.y
+            now = time.monotonic()
+
+            # Per-message velocity-based sanity check:
+            # Reject individual messages where implied speed is physically
+            # impossible, but do NOT set a persistent flag — the next
+            # valid message will be accepted normally.
+            #
+            # CRITICAL: After too many consecutive rejections, the "last
+            # good" position is clearly stale (e.g. SLAM map correction
+            # shifted the frame).  Accept the new reading as baseline to
+            # avoid a death-spiral where ALL messages are rejected forever.
+            if self._odom_received and self._last_odom_time is not None:
+                dt = now - self._last_odom_time
+                if dt > 0.001:  # avoid division by zero
+                    jump = math.hypot(nx - self._x, ny - self._y)
+                    implied_speed = jump / dt
+                    if implied_speed > self._odom_max_speed:
+                        self._consecutive_odom_rejects += 1
+                        if self._consecutive_odom_rejects < self._max_consecutive_odom_rejects:
+                            self.get_logger().warn(
+                                f'Odom glitch: {jump:.1f}m in {dt:.3f}s '
+                                f'({implied_speed:.1f} m/s). '
+                                f'Skipping this message '
+                                f'({self._consecutive_odom_rejects}/'
+                                f'{self._max_consecutive_odom_rejects}).')
+                            # Update timestamp so next check uses correct dt,
+                            # but do NOT update position — keeps last good pos.
+                            self._last_odom_time = now
+                            return  # Skip this single message
+                        else:
+                            # Too many consecutive rejects — the old baseline
+                            # is stale.  Accept this position as the new
+                            # reference to break the death-spiral.
+                            self.get_logger().error(
+                                f'Odom glitch filter: {self._consecutive_odom_rejects} '
+                                f'consecutive rejects!  Old baseline is stale. '
+                                f'Accepting new position ({nx:.2f}, {ny:.2f}) '
+                                f'as baseline (was ({self._x:.2f}, {self._y:.2f})).')
+                            # Fall through to accept below
+
+            self._x   = nx
+            self._y   = ny
             self._yaw = yaw_from_quaternion(msg.pose.pose.orientation)
             self._odom_q = msg.pose.pose.orientation
             self._odom_received = True
+            self._last_odom_time = now
+            self._last_valid_odom_time = now
+            self._consecutive_odom_rejects = 0  # reset streak on accept
 
     def _scan_cb(self, msg: LaserScan):
         with self._lock:
             self._scan = msg
 
     def _get_pose(self):
+        """Get robot pose, preferring SLAM-corrected TF over raw odom."""
+        # Try TF first (SLAM-corrected, map frame)
+        if self._use_tf_pose:
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    'map', 'base_footprint',
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.1))
+                x = t.transform.translation.x
+                y = t.transform.translation.y
+                yaw = yaw_from_quaternion(t.transform.rotation)
+                return x, y, yaw, True
+            except Exception:
+                try:
+                    t = self._tf_buffer.lookup_transform(
+                        'map', 'base_link',
+                        rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=0.1))
+                    x = t.transform.translation.x
+                    y = t.transform.translation.y
+                    yaw = yaw_from_quaternion(t.transform.rotation)
+                    return x, y, yaw, True
+                except Exception:
+                    pass  # Fall through to raw odom
+
+        # Fallback: raw odom
         with self._lock:
             return self._x, self._y, self._yaw, self._odom_received
 
@@ -204,6 +291,8 @@ class AbsoluteMoveNode(Node):
         tx = goal_handle.request.target_x
         ty = goal_handle.request.target_y
         th = normalize_angle(goal_handle.request.target_heading)
+
+        # No persistent corruption flag — per-message filtering handles glitches
 
         result   = AbsoluteMove.Result()
         feedback = AbsoluteMove.Feedback()
@@ -365,6 +454,21 @@ class AbsoluteMoveNode(Node):
             if goal_handle.is_cancel_requested:
                 self._stop(); return 'cancelled'
 
+            # Emergency stop if odom has been rejected too long.
+            # If we are actively publishing cmd_vel but have no valid
+            # position updates, the robot is driving blind.
+            with self._lock:
+                last_valid = self._last_valid_odom_time
+            if last_valid is not None:
+                odom_blackout = time.monotonic() - last_valid
+                if odom_blackout > 1.0:
+                    self._stop()
+                    self.get_logger().error(
+                        f'EMERGENCY STOP: No valid odom for '
+                        f'{odom_blackout:.1f}s while driving. '
+                        f'Aborting Phase 2.')
+                    return 'partial'
+
             # ── Tilt recovery ─────────────────────────────────────
             if self._get_tilt() > self._tilt_threshold:
                 if not self._try_tilt_recovery():
@@ -457,6 +561,20 @@ class AbsoluteMoveNode(Node):
         while abs(heading_err) > self._head_tol:
             if goal_handle.is_cancel_requested:
                 self._stop(); return False
+
+            # Emergency stop if odom has been rejected too long.
+            with self._lock:
+                last_valid = self._last_valid_odom_time
+            if last_valid is not None:
+                odom_blackout = time.monotonic() - last_valid
+                if odom_blackout > 1.0:
+                    self._stop()
+                    self.get_logger().error(
+                        f'EMERGENCY STOP: No valid odom for '
+                        f'{odom_blackout:.1f}s while rotating. '
+                        f'Aborting Phase 3.')
+                    return None
+
             if self._get_tilt() > self._tilt_threshold:
                 if not self._try_tilt_recovery():
                     return None
@@ -519,7 +637,9 @@ class AbsoluteMoveNode(Node):
         blocked = False
         for i in range(fwd_idx - half, fwd_idx + half + 1):
             r = ranges[i % n]
-            if scan.range_min < r < safe:
+            # LDS-01 returns 0.0 for out of range (or very close). 
+            # Treat 0.0 as safe (infinity), but if it's within [0.01, safe], it's an obstacle.
+            if 0.01 < r < safe:
                 blocked = True
                 break
         if not blocked:
@@ -529,7 +649,7 @@ class AbsoluteMoveNode(Node):
         open_mask = []
         for i in range(n):
             r = ranges[i]
-            open_mask.append(r > safe or r < scan.range_min)
+            open_mask.append(r > safe or r < 0.01)
 
         # Group consecutive open indices into gap runs
         gaps = []
@@ -550,7 +670,8 @@ class AbsoluteMoveNode(Node):
                 gaps.append((start, n - start))
 
         if not gaps:
-            return None  # everything blocked
+            # Everything blocked! Turn around.
+            return normalize_angle(cyaw + math.pi)
 
         # Minimum gap width: ~20 cm robot body at obstacle_distance
         min_gap = max(3, int(0.3 / (safe * inc + 1e-9)))
@@ -568,6 +689,10 @@ class AbsoluteMoveNode(Node):
             if score < best_score:
                 best_score = score
                 best_dir   = gap_world
+        
+        # If no gap was wide enough, turn around
+        if best_dir is None:
+            return normalize_angle(cyaw + math.pi)
 
         return best_dir
 

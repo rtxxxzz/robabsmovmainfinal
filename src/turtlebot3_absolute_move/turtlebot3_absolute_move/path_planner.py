@@ -1,8 +1,8 @@
 """
-Path Planner — A* pathfinding on SLAM occupancy grid.
+Path Planner — Dijkstra pathfinding on SLAM occupancy grid.
 
 Takes the latest OccupancyGrid from SLAM Toolbox, inflates obstacles
-by the robot radius + safety margin, and runs A* to find the shortest
+by the robot radius + safety margin, and runs Dijkstra to find the shortest
 collision-free path from the robot's current position to a goal.
 
 The path is simplified to remove redundant collinear waypoints, then
@@ -11,10 +11,10 @@ returned as a list of (x, y) coordinates in the map/odom frame.
 Algorithm:
   1. Convert start/goal from world coords to grid coords
   2. Inflate occupied cells by robot_radius + safety_margin
-  3. A* with 8-connected neighbours
+  3. Dijkstra with 8-connected neighbours
      - g(n) = cumulative cost (diagonal=√2, cardinal=1)
-     - h(n) = Euclidean distance to goal (admissible)
-     - f(n) = g(n) + h(n)
+     - h(n) = 0 (no heuristic — guarantees finding a path if one exists)
+     - f(n) = g(n)
   4. Backtrace from goal to start
   5. Simplify path (remove collinear intermediate points)
   6. Enforce minimum waypoint spacing
@@ -41,7 +41,7 @@ _OCCUPIED_THRESHOLD = 50
 
 
 class PathPlanner:
-    """A* path planner on an OccupancyGrid with obstacle inflation."""
+    """Dijkstra path planner on an OccupancyGrid with obstacle inflation."""
 
     def __init__(self, inflation_radius=0.18, waypoint_spacing=0.3,
                  unknown_as_free=False, simplify=True):
@@ -111,8 +111,8 @@ class PathPlanner:
                 return None
             sr, sc = free_cell
 
-        # Run A*
-        path_grid = self._astar(sr, sc, gr, gc)
+        # Run Dijkstra
+        path_grid = self._dijkstra(sr, sc, gr, gc)
         if path_grid is None:
             return None
 
@@ -231,11 +231,15 @@ class PathPlanner:
         return inflated
 
     # ------------------------------------------------------------------
-    # A* search
+    # Dijkstra search
     # ------------------------------------------------------------------
 
-    def _astar(self, sr, sc, gr, gc):
-        """A* search on the inflated grid.
+    def _dijkstra(self, sr, sc, gr, gc):
+        """Dijkstra search on the inflated grid (no heuristic).
+
+        Unlike A*, Dijkstra uses h=0 so it explores uniformly outward.
+        This guarantees finding a path if one exists, which is critical
+        for frontier exploration on partially-known SLAM maps.
 
         Returns list of (row, col) from start to goal, or None.
         """
@@ -245,7 +249,7 @@ class PathPlanner:
         height, width = self._height, self._width
         inflated = self._inflated
 
-        # Priority queue: (f_score, counter, row, col)
+        # Priority queue: (g_score, counter, row, col)
         counter = 0
         open_set = [(0.0, counter, sr, sc)]
         came_from = {}
@@ -254,7 +258,7 @@ class PathPlanner:
         closed = np.zeros((height, width), dtype=bool)
 
         while open_set:
-            f, _, cr, cc = heapq.heappop(open_set)
+            g, _, cr, cc = heapq.heappop(open_set)
 
             if cr == gr and cc == gc:
                 # Reconstruct path
@@ -280,11 +284,9 @@ class PathPlanner:
                 tentative_g = g_score[cr, cc] + move_cost
                 if tentative_g < g_score[nr, nc]:
                     g_score[nr, nc] = tentative_g
-                    h = math.hypot(nr - gr, nc - gc)
-                    f_new = tentative_g + h
                     came_from[(nr, nc)] = (cr, cc)
                     counter += 1
-                    heapq.heappush(open_set, (f_new, counter, nr, nc))
+                    heapq.heappush(open_set, (tentative_g, counter, nr, nc))
 
         return None  # no path found
 

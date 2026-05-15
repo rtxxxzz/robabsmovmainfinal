@@ -37,5 +37,9 @@ absolute_move_node:
     tilt_threshold_deg: 40.0      # degrees of combined roll+pitch = tipped
     use_gazebo_reset: false       # false on real hardware
 
+    # --- SLAM-corrected positioning ---
+    use_tf_pose: true             # Use map→base_footprint TF for position (SLAM-corrected)
+                                  # Set false for raw odometry mode (slam:=false)
+
     # --- Real time ---
     use_sim_time: false

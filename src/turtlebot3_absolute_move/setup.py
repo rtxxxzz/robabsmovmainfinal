@@ -32,6 +32,7 @@ setup(
             'absolute_move_client = turtlebot3_absolute_move.absolute_move_client:main',
             'pipeline = turtlebot3_absolute_move.pipeline_orchestrator:main',
             'goal_input = turtlebot3_absolute_move.goal_input:main',
+            'scan_relay = turtlebot3_absolute_move.scan_relay:main',
         ],
     },
 )

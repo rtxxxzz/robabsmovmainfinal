@@ -32,7 +32,8 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from nav_msgs.msg import OccupancyGrid, Odometry
+import tf2_ros
+from nav_msgs.msg import OccupancyGrid
 from turtlebot3_absolute_move_interfaces.action import AbsoluteMove
 from turtlebot3_absolute_move.path_planner import PathPlanner
 
@@ -65,10 +66,13 @@ class GoalInputNode(Node):
 
         # --- State ---
         self._lock = threading.Lock()
-        self._x = self._y = self._yaw = 0.0
-        self._odom_received = False
         self._latest_map = None
         self._map_received = False
+
+        # --- TF2 for map-frame localization ---
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(
+            self._tf_buffer, self)
 
         # --- Path planner (same as pipeline) ---
         self._planner = PathPlanner(
@@ -82,19 +86,8 @@ class GoalInputNode(Node):
             self, AbsoluteMove, '/absolute_move_node/absolute_move')
 
         self.create_subscription(
-            Odometry, 'odom', self._odom_cb, 10,
-            callback_group=self._cb_group)
-
-        self.create_subscription(
             OccupancyGrid, 'map', self._map_cb, 10,
             callback_group=self._cb_group)
-
-    def _odom_cb(self, msg):
-        with self._lock:
-            self._x = msg.pose.pose.position.x
-            self._y = msg.pose.pose.position.y
-            self._yaw = _yaw_from_quaternion(msg.pose.pose.orientation)
-            self._odom_received = True
 
     def _map_cb(self, msg):
         with self._lock:
@@ -102,8 +95,47 @@ class GoalInputNode(Node):
             self._map_received = True
 
     def _get_pose(self):
-        with self._lock:
-            return self._x, self._y, self._yaw
+        """Get robot pose in the MAP frame via TF2."""
+        try:
+            t = self._tf_buffer.lookup_transform(
+                'map', 'base_footprint',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            yaw = _yaw_from_quaternion(t.transform.rotation)
+            return x, y, yaw
+        except Exception:
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    'map', 'base_link',
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=1.0))
+                x = t.transform.translation.x
+                y = t.transform.translation.y
+                yaw = _yaw_from_quaternion(t.transform.rotation)
+                return x, y, yaw
+            except Exception:
+                return 0.0, 0.0, 0.0
+
+    def _map_to_odom(self, map_x, map_y, map_yaw):
+        """Transform a map-frame pose to the odom frame."""
+        try:
+            t = self._tf_buffer.lookup_transform(
+                'odom', 'map',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+            tx = t.transform.translation.x
+            ty = t.transform.translation.y
+            tyaw = _yaw_from_quaternion(t.transform.rotation)
+            cos_t = math.cos(tyaw)
+            sin_t = math.sin(tyaw)
+            odom_x = cos_t * map_x - sin_t * map_y + tx
+            odom_y = sin_t * map_x + cos_t * map_y + ty
+            odom_yaw = _normalize_angle(map_yaw + tyaw)
+            return odom_x, odom_y, odom_yaw
+        except Exception:
+            return map_x, map_y, map_yaw
 
     def _get_map(self):
         with self._lock:
@@ -135,8 +167,6 @@ class GoalInputNode(Node):
         for i, (wx, wy) in enumerate(path):
             is_last = (i == len(path) - 1)
 
-            # Intermediate waypoints: heading toward next waypoint
-            # Final waypoint: user-specified heading
             if is_last:
                 h_rad = math.radians(heading_deg)
             elif i < len(path) - 1:
@@ -145,16 +175,17 @@ class GoalInputNode(Node):
             else:
                 h_rad = 0.0
 
+            # Transform map→odom before sending to action server
+            ox, oy, oh = self._map_to_odom(wx, wy, h_rad)
+
             print(f'    Waypoint {i+1}/{len(path)}: '
                   f'({wx:.2f}, {wy:.2f}, {math.degrees(h_rad):.1f}°)')
 
-            success, fx, fy, msg = self._send_single_goal(wx, wy, h_rad)
+            success, fx, fy, msg = self._send_single_goal(ox, oy, oh)
 
             if not success and is_last:
                 return False, fx, fy, msg
-            # For intermediate waypoints, partial success is OK
 
-        # Return result of the final waypoint
         return success, fx, fy, msg
 
     def _send_direct_goal(self, x, y, heading_deg):
@@ -235,17 +266,34 @@ def main(args=None):
         return
     print('  ✓ Action server connected')
 
-    # Wait for odom
-    print('Waiting for /odom...')
+    # Wait for TF
+    print('Waiting for TF (map → base_footprint)...')
     deadline = time.monotonic() + 10.0
-    while not node._odom_received and time.monotonic() < deadline:
-        time.sleep(0.2)
-    if node._odom_received:
+    tf_ok = False
+    while time.monotonic() < deadline:
+        try:
+            node._tf_buffer.lookup_transform(
+                'map', 'base_footprint',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5))
+            tf_ok = True
+            break
+        except Exception:
+            try:
+                node._tf_buffer.lookup_transform(
+                    'map', 'base_link',
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5))
+                tf_ok = True
+                break
+            except Exception:
+                time.sleep(0.2)
+    if tf_ok:
         cx, cy, cyaw = node._get_pose()
-        print(f'  ✓ Odom received — robot at ({cx:.2f}, {cy:.2f}, '
-              f'{math.degrees(cyaw):.1f}°)')
+        print(f'  ✓ TF received — robot at ({cx:.2f}, {cy:.2f}, '
+              f'{math.degrees(cyaw):.1f}°) in map frame')
     else:
-        print('  ⚠ No /odom yet — will retry when sending goals')
+        print('  ⚠ No TF yet — will retry when sending goals')
 
     # Wait for map
     print('Waiting for /map...')
